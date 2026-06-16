@@ -19,6 +19,8 @@ hf_home/
 ingestion_log.json
 logs/
 *.log
+# Regenerated each run by calibrate_confidence.py (keep calibration_queries.txt, not this)
+calibration_results.csv
 
 # ----- Standalone HTML design diagrams (don't render on GitHub; mermaid in -----
 # ----- README.md / USER_MANUAL.md is the published version) -------------------
