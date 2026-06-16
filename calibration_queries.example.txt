@@ -1,0 +1,36 @@
+# Calibration query set for calibrate_confidence.py
+#
+# Copy this to calibration_queries.txt and replace with queries that reflect how
+# your real corpus will actually be used. Blank lines and '#' comments are ignored.
+#
+# Format (the label is OPTIONAL but strongly recommended — it's what lets the
+# harness recommend a threshold):
+#
+#     answerable | <a query the corpus SHOULD be able to answer well>
+#     escalate   | <a query the corpus genuinely CANNOT answer / is off-topic>
+#     <an untagged query — still measured, just not used for the recommendation>
+#
+# Accepted labels (case-insensitive): answerable/answer/yes/y  vs  escalate/no/n/none.
+# Separator may be a TAB or a '|'. Aim for ~15-30 of each bucket for a stable threshold.
+#
+# --- queries the corpus should answer (replace with your domain) ------------
+answerable | What is the rated flow of the ACME X200 pump?
+answerable | What is the maximum working pressure?
+answerable | How often should the bearings be greased?
+answerable | What grease type is specified for the pump bearings?
+answerable | What is the impeller diameter of the X200?
+answerable | What should I do if the pump cavitates?
+answerable | What torque is used for the suction flange bolts?
+answerable | What seal type does the X200 use?
+#
+# --- queries the corpus should NOT answer (should escalate) -----------------
+escalate | What is the warranty period for the pump?
+escalate | Who manufactures the replacement motor controller?
+escalate | What is the list price of the X200?
+escalate | How do I file a safety incident report with the regulator?
+escalate | What colour should I paint the pump housing?
+escalate | What is the capital of France?
+#
+# --- untagged probes (optional; measured but excluded from the recommendation)
+What noise indicates a problem during operation?
+How do I replace the mechanical seal?

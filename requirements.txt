@@ -1,0 +1,65 @@
+# =============================================================================
+# RAG Pipeline — Python dependencies   (Python 3.13.14, per REQUIREMENTS.md §2.3)
+# =============================================================================
+# Version policy: minimums shown give Python-3.13 wheels + current security
+# fixes. Use the LATEST patch within each line, then COMPILE A LOCKFILE
+# (`uv pip compile` or pip-tools) and run `pip-audit` before each build
+# (NFR-SEC-3). Unpinned entries intentionally resolve to latest.
+#
+# -----------------------------------------------------------------------------
+# GPU PyTorch — IMPORTANT (D5 / RISK-D)
+# -----------------------------------------------------------------------------
+# `torch` MUST come from the CUDA wheel index — NOT the default CPU wheel.
+# RTX 4090 Laptop = Ada / sm_89; any recent cuXXX <= driver CUDA 13.2 works.
+#
+#   Recommended (install torch first, then the rest):
+#     pip install torch --index-url https://download.pytorch.org/whl/cu128
+#     pip install -r requirements.txt
+#
+# The --extra-index-url below lets a one-shot `pip install -r requirements.txt`
+# also pull the CUDA build. Verify after install:
+#     python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# -----------------------------------------------------------------------------
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# ----- Local ML runtime (GPU) ------------------------------------------------
+# PIN the +cu128 LOCAL versions explicitly. The cu128 index tops out at
+# torch 2.11.0+cu128; PyPI carries a HIGHER base (2.12.0, CPU-only), so an
+# unpinned `torch` lets a transitive dep (torchvision via easyocr) upgrade to
+# 2.12.0+cpu and silently kill CUDA (RISK-D). Exact +cu128 pins can't be
+# substituted by a CPU wheel. torchvision 0.26.0 is the match for torch 2.11.0.
+torch==2.11.0+cu128                 # CUDA build from the index above (D5/RISK-D)
+torchvision==0.26.0+cu128          # matched pair; pulled by easyocr — pin it too
+# Cap below 5.0: FlagEmbedding 1.4.0 still calls tokenizer.prepare_for_model,
+# which transformers 5.x removed (XLMRobertaTokenizer has no attribute
+# prepare_for_model at rerank time). transformers 4.x satisfies docling-ibm-models
+# (>=4.42) too. Also note: sentence-transformers SEGFAULTS on import in this env,
+# so FlagEmbedding is the reranker loader, not the ST CrossEncoder alternative.
+transformers<5.0                  # reranker (FlagEmbedding) + Docling backbone
+docling[easyocr]>=2.59            # parsing (DocLayNet/TableFormer) + EasyOCR (D6)
+FlagEmbedding                     # BGE cross-encoder reranker (bge-reranker-v2-m3)
+# sentence-transformers           # alt reranker loader — currently segfaults on import
+
+# ----- Orchestration / state -------------------------------------------------
+langgraph>=1.2
+langgraph-checkpoint-postgres     # Postgres checkpoint store (D15)
+psycopg[binary,pool]>=3.2         # Postgres driver + connection pool
+langchain-core>=1.4.7
+
+# ----- OpenAI + tokenization -------------------------------------------------
+openai>=2.41.1
+tiktoken
+
+# ----- Neo4j -----------------------------------------------------------------
+neo4j>=6.2
+# neo4j-graphrag>=0.6.2           # optional vector/index helpers
+
+# ----- Config / validation / utils -------------------------------------------
+pydantic>=2.13
+pydantic-settings                 # typed config object loading the §2.5 schema
+python-dotenv>=1.2.2
+tenacity>=9.1.4
+numpy>=2
+
+# ----- Dev / security (optional) ---------------------------------------------
+# pip-audit                       # dependency vulnerability scan (NFR-SEC-3)

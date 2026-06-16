@@ -1,0 +1,39 @@
+# =============================================================================
+# RAG Pipeline — local infrastructure.
+# Neo4j runs in Docker (this file). Postgres (the LangGraph checkpoint store, D15)
+# is installed NATIVELY on the laptop — see REQUIREMENTS.md C6 — so it is NOT here.
+#
+# Bind to 127.0.0.1 only (NFR-SEC-5). Data on a named volume (NFR-REL-6).
+# Substitution values come from the sibling `.env` file (see .env.example).
+#
+#   Start:   docker compose up -d
+#   Stop:    docker compose down            (add -v to also delete the volume/data)
+#   Logs:    docker compose logs -f
+# After Neo4j is healthy, run the app bootstrap (REQUIREMENTS.md §2.4) to create
+# Neo4j indexes (FR-S0.5) and the Postgres checkpointer tables (FR-S0.5a).
+# Neo4j setup details: NEO4J_SETUP.md
+# =============================================================================
+name: rag-pipeline
+
+services:
+  neo4j:
+    # Pin to the latest 2026.x community image (matches neo4j driver 6.x).
+    # Vector + full-text indexes are native — no plugins required.
+    # See NEO4J_SETUP.md §3 for tag selection / verification.
+    image: neo4j:2026.05-community
+    container_name: rag-neo4j
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7474:7474"   # HTTP / Browser — localhost only
+      - "127.0.0.1:7687:7687"   # Bolt          — localhost only
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    # Connectivity + index creation are verified/performed by the app
+    # bootstrap (REQUIREMENTS.md FR-S0.5), so no DB-auth healthcheck here.
+
+volumes:
+  neo4j_data:
+  neo4j_logs:

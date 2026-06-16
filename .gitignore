@@ -1,0 +1,65 @@
+# =============================================================================
+# RAG Pipeline — .gitignore
+# =============================================================================
+
+# ----- Secrets / config (NFR-SEC-1) -----------------------------------------
+.env
+.env.*
+!.env.example
+
+# ----- Local model weight cache (Docling / BGE / EasyOCR, FR-S0.3) ----------
+.model_cache/
+.cache/
+# Hugging Face / Torch caches if placed in-project
+hf_home/
+.huggingface/
+
+# ----- Runtime outputs / logs -----------------------------------------------
+ingestion_log.json
+logs/
+*.log
+
+# ----- Standalone HTML design diagrams (don't render on GitHub; mermaid in -----
+# ----- README.md / USER_MANUAL.md is the published version) -------------------
+ingestion_pipeline_diagram.html
+rag_pipeline_diagram.html
+
+# ----- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ----- Virtual environments -------------------------------------------------
+.venv/
+venv/
+env/
+.python-version
+
+# ----- Lockfiles: keep these (committed intentionally) ----------------------
+# requirements.lock and uv.lock SHOULD be committed — do not ignore them.
+
+# ----- Local SQLite (legacy / scratch; checkpoint store is Postgres now) ----
+*.sqlite
+*.sqlite3
+*.db
+
+# ----- IDE / editor ---------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*~
+
+# ----- OS --------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
