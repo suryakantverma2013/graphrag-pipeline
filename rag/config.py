@@ -79,6 +79,13 @@ class AppConfig(BaseSettings):
     # = smaller page bitmaps = less memory during preprocess. 72 = Docling default
     # (unchanged behavior); drop to e.g. 48 to relieve memory pressure.
     pdf_render_dpi: int = 72
+    # Page-range batch size for parsing (PDF only). Docling accumulates memory
+    # within a single convert() call and OOMs (std::bad_alloc) on very large PDFs
+    # (~127 pages on a 24 GB box, independent of DPI/OCR). When > 0, a PDF is
+    # parsed in slices of this many pages, releasing memory between slices, then
+    # chunked contiguously — capturing the WHOLE document. 0 = single convert
+    # (legacy). 100 leaves headroom under the observed ceiling.
+    pdf_parse_batch_pages: int = 100
 
     # --- Tunables (defaults from the diagrams / decisions) ---
     chunk_max_tokens: int = 512             # FR-3.4

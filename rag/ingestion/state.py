@@ -35,9 +35,14 @@ class IngestionState(BaseModel):
     temp_path: str | None = None                    # transient parse file (FR-2.5)
 
     # Stage payloads
-    docling_document: Any | None = None             # DoclingDocument tree (FR-2.4)
+    # NOTE: the parsed DoclingDocument is NOT held in this (checkpointed) state.
+    # It is a heavy, non-msgpack-serializable tree that only `chunk` consumes, so
+    # `parse` hands it to `chunk` via a process-local handoff (nodes._DOC_HANDOFF)
+    # instead of a persisted channel — otherwise the Postgres checkpointer fails
+    # serializing it (FR-2.4 / state hygiene).
     title: str | None = None
     page_count: int | None = None
+    parse_failed_pages: int = 0                     # Docling PARTIAL_SUCCESS: pages dropped (FR-2.6a)
     chunks: list[dict[str, Any]] = Field(default_factory=list)   # FR-3.x
     total_tokens: int | None = None
     iirds_tags: dict[str, Any] | None = None        # FR-4.2

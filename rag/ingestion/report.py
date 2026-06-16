@@ -45,6 +45,16 @@ def report_result(graph, cfg: dict, result: dict, thread_id: str, elapsed: float
     status = _status_of(result)
     if status is IngestStatus.COMPLETED:
         meta = result.get("embeddings_meta") or {}
+        failed_pages = result.get("parse_failed_pages") or 0
+        page_count = result.get("page_count")
+        # FR-2.6a: never let a partial parse look like a clean ingest.
+        incomplete = (
+            f"  ⚠ INCOMPLETE: {failed_pages}"
+            + (f"/{page_count}" if page_count else "")
+            + " page(s) failed to parse (e.g. memory pressure) — their content is\n"
+            "    NOT in the graph. Lower PDF_RENDER_DPI or cap PDF_MAX_PAGES and re-ingest.\n"
+            if failed_pages else ""
+        )
         print(
             "\nIngestion complete:\n"
             f"  title:       {result.get('title')}\n"
@@ -53,6 +63,7 @@ def report_result(graph, cfg: dict, result: dict, thread_id: str, elapsed: float
             f"({meta.get('tokens_used', 0)} tokens)\n"
             f"  wall-clock:  {elapsed:.1f}s\n"
             f"  thread_id:   {thread_id}\n"
+            + incomplete
         )
         return EXIT_OK
     if status is IngestStatus.DUPLICATE:

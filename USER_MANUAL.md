@@ -30,6 +30,7 @@
 9. [Command-line reference](#9-command-line-reference)
 10. [Human-in-the-loop operations](#10-human-in-the-loop-operations)
 11. [Observability: logs, receipts, run state](#11-observability-logs-receipts-run-state)
+    - [11.1 Resetting the graph (dropping indexes & data)](#111-resetting-the-graph-dropping-indexes--data)
 12. [Cost model](#12-cost-model)
 13. [Known limitations & caveats](#13-known-limitations--caveats)
 14. [Troubleshooting](#14-troubleshooting)
@@ -284,9 +285,10 @@ All settings come from environment variables (loaded from `.env`). A single type
 |---|---|---|
 | `OCR_ENABLED` | `true` | OCR for scanned/image PDFs. Set `false` for large **born‑digital** PDFs (those with a real text layer) — OCR is the heaviest, most memory‑hungry parse stage and is unnecessary there. Biggest lever against `std::bad_alloc` on large books. |
 | `PDF_MAX_PAGES` | `0` | Parse only the first N pages of a PDF (`0` = all). Bounds memory/time on very large documents. |
-| `PDF_RENDER_DPI` | `72` | Page rasterization resolution (Docling `images_scale = dpi/72`). Lower (e.g. `48`) = smaller page bitmaps = less memory. `72` is the Docling default. |
+| `PDF_RENDER_DPI` | `72` | Page rasterization resolution (Docling `images_scale = dpi/72`). Lower (e.g. `48`) = smaller page bitmaps = less memory. `72` is the Docling default. **Note:** does *not* fix `std::bad_alloc` on very large PDFs — that ceiling is page-count-driven, not DPI-driven (use `PDF_PARSE_BATCH_PAGES`). |
+| `PDF_PARSE_BATCH_PAGES` | `100` | Parse large PDFs in N-page slices, freeing memory between slices so Docling never accumulates past its `std::bad_alloc` ceiling — captures the **whole** document. `0` = single-shot convert (legacy). This is the real fix for big books. |
 
-> **Ingesting a large text PDF (e.g. a 1000+ page book).** The default OCR pipeline rasterizes every page and can exhaust memory (`std::bad_alloc`). For a born‑digital PDF, set `OCR_ENABLED=false` — that alone usually fixes it. For extreme cases, also cap pages (`PDF_MAX_PAGES=200`) or lower `PDF_RENDER_DPI`. Splitting the document into chapters and ingesting each separately remains the most robust approach for very large books.
+> **Ingesting a large text PDF (e.g. a 600+ page book).** Two independent memory pressures: (1) **OCR** rasterizes/recognizes every page — for a born‑digital PDF set `OCR_ENABLED=false` (it's unnecessary and the heaviest stage). (2) Docling **accumulates memory within a single `convert()` call** and hits `std::bad_alloc` at a fixed page depth (~127 pages here) *regardless of DPI*. The fix for (2) is `PDF_PARSE_BATCH_PAGES` (default `100`): the PDF is parsed in page-range slices that free memory between them, so the **entire** book is captured — chunking stays continuous across slices. A 610‑page book that previously lost ~half its pages now ingests all 610 with `failed_pages=0`. (Lowering `PDF_RENDER_DPI` does *not* help case (2); `PDF_MAX_PAGES` only truncates.)
 
 **Tunables**
 
@@ -399,8 +401,8 @@ flowchart TD
 
     MG --> CE[cross_encoder_rerank<br/>BGE · GPU · top-10]
     CE --> AC[assess_confidence<br/>composite signal]
-    AC -->|composite &lt; 0.4| ES{{escalate · interrupt<br/>resume_query.py thread_id}}
-    AC -->|composite ≥ 0.4| SY[synthesize_answer · OpenAI<br/>RRF across sub-queries + citations]
+    AC -->|composite &lt; 0.38| ES{{escalate · interrupt<br/>resume_query.py thread_id}}
+    AC -->|composite ≥ 0.38| SY[synthesize_answer · OpenAI<br/>RRF across sub-queries + citations]
     ES -. "resume: proceed best-effort" .-> SY
     SY --> END([Answer + citations · Exit 0])
 
@@ -426,7 +428,7 @@ flowchart TD
 10. **cross_encoder_rerank.** The BGE re‑ranker (local, GPU, fp16) scores each (sub‑query, chunk) pair and keeps the top `RERANK_TOP_K` (10) per unit. Loaded once per process and kept resident.
 11. **assess_confidence.** Computes a composite signal from the re‑rank scores: `0.5·top + 0.3·avg_top3 + 0.2·gap` (rank‑1 minus rank‑2). For decomposed queries it **pools** scores across units. `< 0.4` → escalate; `≥ 0.4` → synthesize.
 12. **escalate** *(interrupt)*. Surfaces the low‑confidence candidates for expert review **before** any answer is returned. On acknowledgement the run proceeds best‑effort to synthesis. Resume via `resume_query.py`.
-13. **synthesize_answer.** Generates the answer with `SYNTHESIS_MODEL` over the top re‑ranked chunks. For decomposed queries it RRF‑fuses the per‑unit rank lists first (a no‑op for single‑unit queries) using the same RRF helper as merge. The answer is grounded in retrieved chunks with **citations** (document/chunk ids); unsupported claims are avoided.
+13. **synthesize_answer.** Generates the answer with `SYNTHESIS_MODEL` over the top re‑ranked chunks. For decomposed queries it RRF‑fuses the per‑unit rank lists first (a no‑op for single‑unit queries) using the same RRF helper as merge. The answer is grounded in retrieved chunks with **citations** (document/chunk ids); unsupported claims are avoided. The reported citations are **trimmed to the passage markers the answer actually references** — all top‑ranked chunks still feed the model as context, but a focused answer won't list weakly‑related chunks as sources (markers keep their original numbers so they match the inline `[n]` references).
 14. **END.** Returns the answer, citations, and `thread_id`; exits `0`.
 
 ---
@@ -515,6 +517,57 @@ Three distinct, coexisting records — don't confuse them:
 - **No full payloads** — document text, chunk text, and embedding vectors are omitted/truncated/summarized (lengths, counts, ids only).
 - Third‑party loggers (`httpx`, `openai`, `neo4j`, `psycopg`, `transformers`, `docling`, `urllib3`) default to `WARNING` regardless of app `LOG_LEVEL`. Set `LOG_LEVEL=DEBUG` for verbose app tracing; set `LOG_FORMAT=text` for readable local debugging.
 
+### 11.1 Resetting the graph (dropping indexes & data)
+
+This system creates exactly **three** schema objects in Neo4j (defined in `rag/clients/neo4j_client.py`):
+
+| Name | Type | Drop with |
+|---|---|---|
+| `chunk_embedding` | vector index (1536‑d, cosine) | `DROP INDEX` |
+| `chunk_fulltext` | full‑text index (BM25 over `Chunk.text`) | `DROP INDEX` |
+| `document_id_unique` | unique **constraint** on `Document.id` (owns a backing index) | `DROP CONSTRAINT` |
+
+Run these in **Neo4j Browser** (`http://localhost:7474`) or `cypher-shell`:
+
+```cypher
+-- Inspect first
+SHOW INDEXES;
+SHOW CONSTRAINTS;
+
+-- Drop this project's indexes/constraint by name (idempotent)
+DROP INDEX chunk_embedding IF EXISTS;
+DROP INDEX chunk_fulltext  IF EXISTS;
+DROP CONSTRAINT document_id_unique IF EXISTS;   -- drops its backing index too
+```
+
+> A constraint-backed index **cannot** be removed with `DROP INDEX` (it errors with "index belongs to constraint") — drop the **constraint** instead, as above.
+
+**Drop *every* index/constraint** (e.g. a full schema reset), regardless of name — there is no single "drop all" statement, so iterate over what `SHOW` returns:
+
+```cypher
+-- run SHOW INDEXES; / SHOW CONSTRAINTS; then issue a DROP per name, e.g.:
+SHOW CONSTRAINTS YIELD name;   -- DROP CONSTRAINT <name> IF EXISTS;  for each
+SHOW INDEXES     YIELD name;   -- DROP INDEX <name>      IF EXISTS;  for each (skip Neo4j's built-in token-lookup indexes)
+```
+
+**Full reset** (clear all data *and* schema, then start clean):
+
+```cypher
+MATCH (n) DETACH DELETE n;                       -- removes Documents, Chunks, iiRDS nodes, IngestionRecords
+DROP INDEX chunk_embedding IF EXISTS;
+DROP INDEX chunk_fulltext  IF EXISTS;
+DROP CONSTRAINT document_id_unique IF EXISTS;
+```
+```powershell
+python setup_models.py    # re-creates the three indexes (bootstrap), then re-ingest your documents
+```
+
+**Caveats:**
+- The three objects are **recreated automatically** — `setup_models.py` (bootstrap) and every ingestion write re‑run idempotent `CREATE … IF NOT EXISTS` DDL. After dropping, the next bootstrap or ingest brings them back.
+- Dropping data alone does **not** require dropping indexes (they survive node deletion and stay valid, just empty).
+- While `chunk_embedding` is missing, **vector retrieval returns nothing** — queries degrade gracefully (they don't crash) until it's recreated.
+- Deleting a `Document` does not require re‑ingesting others; to delete one document and its chunks, see the per‑document delete pattern (match the `Document` by `id` and `DETACH DELETE` it with its `:HAS_CHUNK` chunks and `:INGESTION_OF` record).
+
 ---
 
 ## 12. Cost model
@@ -563,7 +616,7 @@ Stated honestly, per the project's standards.
 | Bootstrap fails on Postgres | Service not running / role missing | Start the native Postgres service; create the `langgraph` role+db; keep `CHECKPOINT_DB_URI` in sync; see `POSTGRES_SETUP.md` |
 | Ingest exits `3` immediately | Document already ingested (same bytes) | Expected — re‑ingestion isn't supported. Ingest a changed file as new. |
 | Ingest exits `1` with `INTAKE_ERROR` | Path missing/unreadable or unsupported format | Use a supported format (PDF, DOCX, HTML, XML, TXT, MD) and a readable path. |
-| Ingest **hangs** on a large PDF; log shows `std::bad_alloc` repeating per page | Out of memory parsing a huge document with OCR on (e.g. a 1000+ page book) | Stop it (`Ctrl+C` — atomic design means no partial graph data). Set `OCR_ENABLED=false` for born-digital PDFs; optionally `PDF_MAX_PAGES=N` and/or lower `PDF_RENDER_DPI`. Or split the document into chapters. See [§6](#6-configuration-reference). |
+| Ingest log shows `std::bad_alloc` repeating per page; summary says `⚠ INCOMPLETE: N pages failed` | Docling exhausts memory mid-parse on a very large PDF (accumulates within one `convert()` call) | Keep `PDF_PARSE_BATCH_PAGES` at its default `100` (or lower it) so the PDF is parsed in slices — this captures the whole book. Also set `OCR_ENABLED=false` for born-digital PDFs. Lowering `PDF_RENDER_DPI` will *not* help here. Re-ingest after changing. See [§6](#6-configuration-reference). |
 | Ingest exits `1` with `EMBED_ERROR` | OpenAI outage/quota after 3 retries | No graph write occurred; fix the OpenAI issue and re‑submit the file. |
 | Query exits `4` (clarification/escalation) | Low‑confidence refinement or retrieval | `python resume_query.py <thread_id>` and follow the prompts. |
 | Query escalates too often | Strict re‑ranker on a small/unrepresentative corpus | Ingest more representative content; recalibrate via `calibrate_confidence.py` ([§16](#16-calibrating-confidence-thresholds)). The default `0.38` was calibrated on the real corpus. |

@@ -609,9 +609,22 @@ def synthesize_answer(state: QueryState) -> dict:
     answer = _openai().chat(
         [{"role": "system", "content": _SYNTH_SYSTEM}, {"role": "user", "content": user}],
         model=config.synthesis_model,  # FR-Q4.1 / D8 — configurable, no code change
+    ).strip()
+
+    # FR-Q4.3 — report only the citations the answer actually references inline.
+    # All RERANK_TOP_K chunks still feed the LLM context (above) for grounding; we
+    # just drop the ones the model didn't cite, so a focused answer doesn't list
+    # weakly-related chunks as "sources". Markers are kept as-is (NOT renumbered) so
+    # they still line up with the [n] references in the answer text. If the model
+    # emitted no markers at all (e.g. an explicit no-answer), keep the full set so a
+    # substantive answer is never returned citation-less.
+    referenced = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
+    cited = [c for c in citations if c["marker"] in referenced] if referenced else citations
+    logger.info(
+        "synthesize: answer_len=%d citations=%d/%d referenced",
+        len(answer), len(cited), len(citations),
     )
-    logger.info("synthesize: answer_len=%d citations=%d", len(answer), len(citations))
-    return {"answer": answer.strip(), "citations": citations}
+    return {"answer": answer, "citations": cited}
 
 
 # === Routing (real) =========================================================

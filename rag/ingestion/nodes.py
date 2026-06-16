@@ -99,6 +99,15 @@ def _encoder():
     return tiktoken.get_encoding("cl100k_base")
 
 
+# Process-local handoff for the parsed DoclingDocument from `parse` to `chunk`.
+# The tree is heavy and NOT msgpack-serializable, so it must never enter the
+# checkpointed state (the Postgres checkpointer would fail on it). `parse` and
+# `chunk` always run back-to-back in the same process — the only interrupt is at
+# human_review, well after chunk — so a per-thread_id stash is safe. Keyed by
+# thread_id; popped (and thus freed) in `chunk`.
+_DOC_HANDOFF: dict[str, Any] = {}
+
+
 def _node(stage: str) -> Callable:
     """Scope the log `stage`, log entry, and record wall-clock ms (FR-0.5)."""
 
@@ -211,48 +220,107 @@ def _document_title(doc: Any, source: Path) -> str:
     return _pdf_metadata_title(source) or source.stem
 
 
+def _pdf_page_count(path: Path) -> int | None:
+    """Total PDF page count via pypdfium2 (cheap, no full parse). None on failure."""
+    try:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(str(path))
+        try:
+            return len(pdf)
+        finally:
+            pdf.close()
+    except Exception:  # noqa: BLE001 — fall back to a single convert if unknown
+        logger.debug("could not read PDF page count for %s", path, exc_info=True)
+        return None
+
+
+def _plan_page_ranges(path: Path, config: AppConfig, is_pdf: bool) -> list[tuple[int, int] | None]:
+    """Plan the Docling convert calls (FR-2.8c).
+
+    Non-PDF → one convert with no page_range. PDF → respect `PDF_MAX_PAGES` (cap)
+    and split into `PDF_PARSE_BATCH_PAGES`-page slices so Docling releases memory
+    between slices (avoids the cumulative std::bad_alloc on very large PDFs). A
+    `None` entry means "convert the whole file" (legacy single-shot path)."""
+    if not is_pdf:
+        return [None]
+    total = _pdf_page_count(path)
+    cap = config.pdf_max_pages
+    batch = config.pdf_parse_batch_pages
+    if total is None:  # unknown page count → single convert (still honor the cap)
+        return [(1, cap)] if cap > 0 else [None]
+    last = min(total, cap) if cap > 0 else total
+    if batch > 0 and last > batch:
+        return [(lo, min(lo + batch - 1, last)) for lo in range(1, last + 1, batch)]
+    return [(1, last)] if cap > 0 else [None]
+
+
 @_node(PARSE)
 def parse(state: IngestionState) -> dict:
     from docling.datamodel.base_models import ConversionStatus
 
     src = Path(state.file_path)
+    is_pdf = src.suffix.lower() == ".pdf"
     # FR-2.5 materialize raw bytes to a private temp file for parsing, then delete
     # immediately (success or failure). mkstemp creates an owner-only file
     # (NFR-SEC-6); raw bytes never leave the device (FR-2.1, local-only Docling).
     fd, temp_name = tempfile.mkstemp(suffix=src.suffix.lower(), prefix="rag_ingest_")
     temp_path = Path(temp_name)
     config = get_config()
-    # Optional page cap (config): parse only the first N pages of a PDF (0 = all).
-    # Bounds memory/time on very large PDFs; page_range is PDF-only in Docling.
-    convert_kwargs: dict[str, Any] = {}
-    if config.pdf_max_pages > 0 and src.suffix.lower() == ".pdf":
-        convert_kwargs["page_range"] = (1, config.pdf_max_pages)
-        logger.info("PDF page cap active: parsing pages 1-%s", config.pdf_max_pages)
+    # FR-2.8c: large PDFs are parsed in page-range slices so Docling releases
+    # memory between convert() calls (it otherwise OOMs on very large books). One
+    # reused converter; each slice's finished DoclingDocument is kept, transient
+    # render buffers are freed. Non-PDF / small PDF → a single (legacy) convert.
+    docs: list[Any] = []
+    failed_pages = 0
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(src.read_bytes())
+        # Plan slices AFTER writing bytes (page count is read from the temp file).
+        page_ranges = _plan_page_ranges(temp_path, config, is_pdf)
+        if len(page_ranges) > 1:
+            logger.info("PDF parsed in %d page-slice(s) of <=%d pages",
+                        len(page_ranges), config.pdf_parse_batch_pages)
         # FR-2.1/2.2/2.3 local Docling (DocLayNet + TableFormer + EasyOCR, GPU).
-        result = build_converter(config).convert(str(temp_path), **convert_kwargs)
+        converter = build_converter(config)
+        for page_range in page_ranges:
+            kwargs: dict[str, Any] = {"page_range": page_range} if page_range else {}
+            result = converter.convert(str(temp_path), **kwargs)
+            if result.status == ConversionStatus.FAILURE:
+                where = f" (pages {page_range[0]}-{page_range[1]})" if page_range else ""
+                return _terminal(IngestStatus.PARSE_ERROR, f"Docling reported FAILURE for {src.name}{where}")
+            failed_pages += len(getattr(result, "errors", []) or [])
+            docs.append(result.document)
+            del result  # release this slice's transient buffers before the next
     except Exception as exc:  # noqa: BLE001 — any parse failure → terminal (FR-2.6)
         logger.error("Docling parse raised", exc_info=True)
         return _terminal(IngestStatus.PARSE_ERROR, f"parse failed: {exc}")
     finally:
         temp_path.unlink(missing_ok=True)  # FR-2.5 delete temp immediately
 
-    if result.status == ConversionStatus.FAILURE:
-        return _terminal(IngestStatus.PARSE_ERROR, f"Docling reported FAILURE for {src.name}")
-
-    doc = result.document
-    if not doc.export_to_text().strip():  # FR-2.6 zero content
+    if not any(d.export_to_text().strip() for d in docs):  # FR-2.6 zero content
         return _terminal(IngestStatus.PARSE_ERROR, f"parsed document has no extractable text: {src.name}")
 
-    title = _document_title(doc, src)
-    page_count = doc.num_pages()
-    logger.info("parse ok: title=%r pages=%s status=%s", title, page_count, result.status.value)
+    # Title from the first slice (TITLE element is on page 1) → PDF /Title → stem.
+    title = _document_title(docs[0], src)
+    page_count = sum(d.num_pages() for d in docs)
+    logger.info("parse ok: title=%r pages=%s slices=%d failed_pages=%d",
+                title, page_count, len(docs), failed_pages)
+    # FR-2.6a: a partial parse (some pages dropped under memory pressure) must NOT
+    # masquerade as a clean ingest — count the dropped pages so the run can WARN.
+    if failed_pages:
+        logger.warning(
+            "Docling parse INCOMPLETE for %s: %d/%d page(s) failed — content is missing",
+            src.name, failed_pages, page_count,
+        )
+    # Hand the heavy Docling trees to `chunk` out-of-band (NOT via checkpointed
+    # state — not msgpack-serializable; see _DOC_HANDOFF). chunk consumes the list
+    # in order with continuous section/position tracking.
+    _DOC_HANDOFF[state.thread_id] = docs
     return {
-        "docling_document": doc,
         "title": title,
         "page_count": page_count,
+        "parse_failed_pages": failed_pages,
         "pipeline_status": IngestStatus.RUNNING,
     }
 
@@ -317,9 +385,12 @@ def chunk(state: IngestionState) -> dict:
 
     config = get_config()
     enc = _encoder()
-    doc = state.docling_document
-    if doc is None:  # defensive: parse must have run (FR-2.7)
-        return _terminal(IngestStatus.PARSE_ERROR, "no parsed document available for chunking")
+    docs = _DOC_HANDOFF.pop(state.thread_id, None)
+    if not docs:  # defensive: parse must have run in THIS process (FR-2.7)
+        return _terminal(
+            IngestStatus.PARSE_ERROR,
+            "no parsed document available for chunking (process restarted mid-run?)",
+        )
 
     chunks: list[dict[str, Any]] = []
     section_stack: list[tuple[int, str]] = []  # (level, heading text)
@@ -366,57 +437,62 @@ def chunk(state: IngestionState) -> dict:
         add_chunk("\n".join(list_buffer), CT_LIST)
         list_buffer.clear()
 
-    for item, _level in doc.iterate_items():
-        label = getattr(item, "label", None)
-        item_text = (getattr(item, "text", "") or "").strip()
+    # Consume each page-slice in order. Accumulators (chunks, section_stack,
+    # text/list buffers) persist ACROSS slices so a section heading, paragraph, or
+    # list that straddles a batch boundary stays continuous — we only flush at
+    # section headers and once at the very end, never between slices (FR-2.8c).
+    for doc in docs:
+        for item, _level in doc.iterate_items():
+            label = getattr(item, "label", None)
+            item_text = (getattr(item, "text", "") or "").strip()
 
-        # Section headings → context only, not standalone chunks (FR-3.6).
-        if label in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
-            flush_text()
-            flush_list()
-            if label == DocItemLabel.TITLE:
-                continue  # title already feeds section_path()
-            level = getattr(item, "level", len(section_stack) + 1) or 1
-            while section_stack and section_stack[-1][0] >= level:
-                section_stack.pop()
-            if item_text:
-                section_stack.append((level, item_text))
-            continue
+            # Section headings → context only, not standalone chunks (FR-3.6).
+            if label in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
+                flush_text()
+                flush_list()
+                if label == DocItemLabel.TITLE:
+                    continue  # title already feeds section_path()
+                level = getattr(item, "level", len(section_stack) + 1) or 1
+                while section_stack and section_stack[-1][0] >= level:
+                    section_stack.pop()
+                if item_text:
+                    section_stack.append((level, item_text))
+                continue
 
-        # List items group together until the run ends.
-        if label == DocItemLabel.LIST_ITEM:
-            flush_text()
-            if item_text:
-                list_buffer.append(item_text)
-            continue
-        flush_list()  # any non-list item ends a list run
+            # List items group together until the run ends.
+            if label == DocItemLabel.LIST_ITEM:
+                flush_text()
+                if item_text:
+                    list_buffer.append(item_text)
+                continue
+            flush_list()  # any non-list item ends a list run
 
-        # Tables → exactly one chunk each, structure preserved (FR-3.1).
-        if label == DocItemLabel.TABLE:
-            flush_text()
-            try:
-                table_md = item.export_to_markdown(doc).strip()
-            except Exception:  # noqa: BLE001 — fall back to plain text on export quirks
-                table_md = item_text
-            add_chunk(table_md, CT_TABLE)
-            continue
+            # Tables → exactly one chunk each, structure preserved (FR-3.1).
+            if label == DocItemLabel.TABLE:
+                flush_text()
+                try:
+                    table_md = item.export_to_markdown(doc).strip()
+                except Exception:  # noqa: BLE001 — fall back to plain text on export quirks
+                    table_md = item_text
+                add_chunk(table_md, CT_TABLE)
+                continue
 
-        # Code/formula → kept whole (never fragmented), like tables.
-        if label in (DocItemLabel.CODE, DocItemLabel.FORMULA):
-            flush_text()
-            add_chunk(item_text, CT_CODE)
-            continue
+            # Code/formula → kept whole (never fragmented), like tables.
+            if label in (DocItemLabel.CODE, DocItemLabel.FORMULA):
+                flush_text()
+                add_chunk(item_text, CT_CODE)
+                continue
 
-        if not item_text:
-            continue
-        # Safety-critical warnings → one unfragmented chunk each (FR-3.3).
-        if _WARNING_RE.match(item_text):
-            flush_text()
-            add_chunk(item_text, CT_WARNING)
-            continue
+            if not item_text:
+                continue
+            # Safety-critical warnings → one unfragmented chunk each (FR-3.3).
+            if _WARNING_RE.match(item_text):
+                flush_text()
+                add_chunk(item_text, CT_WARNING)
+                continue
 
-        # Everything else is paragraph/body text → accumulate, split later.
-        text_buffer.append(item_text)
+            # Everything else is paragraph/body text → accumulate, split later.
+            text_buffer.append(item_text)
 
     flush_text()
     flush_list()
@@ -426,12 +502,11 @@ def chunk(state: IngestionState) -> dict:
 
     total_tokens = sum(c["token_count"] for c in chunks)
     logger.info("chunk ok: chunks=%d total_tokens=%d", len(chunks), total_tokens)
-    # Drop the heavy Docling tree now that chunks are extracted (state hygiene;
-    # keeps downstream checkpoints small).
+    # The Docling tree was popped from the handoff above, so it is already freed;
+    # nothing heavy or non-serializable enters the downstream checkpoints.
     return {
         "chunks": chunks,
         "total_tokens": total_tokens,
-        "docling_document": None,
         "pipeline_status": IngestStatus.RUNNING,
     }
 
