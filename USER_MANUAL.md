@@ -297,7 +297,7 @@ All settings come from environment variables (loaded from `.env`). A single type
 | `EMBED_BATCH_SIZE` | `100` | Chunks per embedding API call. |
 | `TAG_CONFIDENCE_THRESHOLD` | `0.5` | Below → suspend for human tag review. |
 | `REFINE_CONFIDENCE_THRESHOLD` | `0.6` | Below → request clarification. |
-| `ESCALATE_CONFIDENCE_THRESHOLD` | `0.4` | Below → escalate retrieval for expert review. |
+| `ESCALATE_CONFIDENCE_THRESHOLD` | `0.38` | Below → escalate retrieval for expert review. Calibrated against the real corpus (see §17). |
 | `PER_RETRIEVER_K` | `25` | Hits per retriever. |
 | `RETRIEVE_TOP_K` | `50` | Merged/deduped candidate cap. |
 | `RERANK_TOP_K` | `10` | Re‑ranked chunks kept for synthesis. |
@@ -542,7 +542,7 @@ Stated honestly, per the project's standards.
 
 **Operational caveats (verified, not bugs):**
 
-1. **The BGE re‑ranker is strict.** On the tiny synthetic sample corpus, paraphrased/verbose/procedural queries often score low, which can push the composite below the 0.4 escalate threshold and trigger escalation more often than you'd expect. The 0.4 threshold and the confidence‑formula weights are reasonable defaults but **likely need recalibration against a real corpus** — that is exactly what `calibrate_confidence.py` is for ([§16](#16-calibrating-confidence-thresholds)).
+1. **The BGE re‑ranker is strict — but this is fine on a real corpus.** On the tiny synthetic sample corpus, paraphrased/verbose/procedural queries scored low and escalated more often than expected. **Calibration against the real corpus (2026‑06‑16) resolved this:** over 25 labeled queries against the Java + Documentum corpus, answerable queries scored 0.639–0.799 and genuinely off‑topic queries scored 0.000–0.120 — cleanly separable, so the default threshold was set to **0.38** (the midpoint of that gap) via `calibrate_confidence.py` ([§16](#16-calibrating-confidence-thresholds)). Re‑run that harness whenever your corpus or query mix changes materially.
 2. **`refine_query` is over‑confident on vague queries** (often ~0.80), so the `< 0.6` clarification path rarely fires naturally on the sample corpus. (It was exercised in testing by temporarily setting `REFINE_CONFIDENCE_THRESHOLD` high.)
 3. **Verbose refinement can hurt re‑ranking**, because the refined query text is what the re‑ranker scores against.
 4. **Scanned‑PDF OCR path is implemented but not yet exercised end‑to‑end.** Only Markdown inputs have been run all the way through; the Docling PDF/EasyOCR GPU path is built and bootstrap‑smoke‑tested but not validated on a real scanned PDF (acceptance criterion AC‑7a).
@@ -566,7 +566,7 @@ Stated honestly, per the project's standards.
 | Ingest **hangs** on a large PDF; log shows `std::bad_alloc` repeating per page | Out of memory parsing a huge document with OCR on (e.g. a 1000+ page book) | Stop it (`Ctrl+C` — atomic design means no partial graph data). Set `OCR_ENABLED=false` for born-digital PDFs; optionally `PDF_MAX_PAGES=N` and/or lower `PDF_RENDER_DPI`. Or split the document into chapters. See [§6](#6-configuration-reference). |
 | Ingest exits `1` with `EMBED_ERROR` | OpenAI outage/quota after 3 retries | No graph write occurred; fix the OpenAI issue and re‑submit the file. |
 | Query exits `4` (clarification/escalation) | Low‑confidence refinement or retrieval | `python resume_query.py <thread_id>` and follow the prompts. |
-| Query escalates too often | Strict re‑ranker on a small corpus | Ingest more representative content; recalibrate via `calibrate_confidence.py` ([§16](#16-calibrating-confidence-thresholds)). |
+| Query escalates too often | Strict re‑ranker on a small/unrepresentative corpus | Ingest more representative content; recalibrate via `calibrate_confidence.py` ([§16](#16-calibrating-confidence-thresholds)). The default `0.38` was calibrated on the real corpus. |
 | HF model download resets mid‑download | Flaky Hugging Face endpoint | Re‑run `setup_models.py`; the downloader retries. Optionally set `HF_TOKEN`. |
 | Garbled characters in console (e.g. em‑dash) | Windows cp1252 stdout display only | Cosmetic — the data stored in Neo4j is correct UTF‑8. |
 | A retriever returns nothing | Empty BM25/vector/graph result | Expected and safe — weighted RRF degrades gracefully (NFR‑REL‑9). |

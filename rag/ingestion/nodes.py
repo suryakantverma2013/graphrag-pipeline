@@ -171,8 +171,36 @@ def intake(state: IngestionState) -> dict:
 
 
 # --- Stage 2: Docling parse (FR-2.x) ----------------------------------------
+def _pdf_metadata_title(source: Path) -> str:
+    """The embedded PDF ``/Title`` (document info dict), if present (best-effort).
+
+    Read locally from the original file via pypdfium2 (a Docling dependency, so
+    no new requirement and no egress, NFR-SEC-5). Never fatal — any failure or a
+    non-PDF source returns "" so the caller falls back to the file stem.
+    """
+    if source.suffix.lower() != ".pdf":
+        return ""
+    try:
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(str(source))
+        try:
+            return (pdf.get_metadata_dict().get("Title") or "").strip()
+        finally:
+            pdf.close()
+    except Exception:  # noqa: BLE001 — metadata is a nicety, never block ingest
+        logger.debug("could not read PDF /Title metadata for %s", source, exc_info=True)
+        return ""
+
+
 def _document_title(doc: Any, source: Path) -> str:
-    """Prefer a TITLE element, else the Docling name, else the file stem (FR-2.7)."""
+    """Resolve a human-readable title (FR-2.7).
+
+    Order: an on-page Docling TITLE element → the embedded PDF ``/Title`` →
+    the original file stem. Docling's ``doc.name`` is deliberately NOT used: we
+    parse from a private temp file (FR-2.5), so it is always the ``rag_ingest_*``
+    temp stem, never anything meaningful.
+    """
     from docling_core.types.doc import DocItemLabel
 
     for item, _level in doc.iterate_items():
@@ -180,8 +208,7 @@ def _document_title(doc: Any, source: Path) -> str:
             text = (getattr(item, "text", "") or "").strip()
             if text:
                 return text
-    name = (getattr(doc, "name", "") or "").strip()
-    return name or source.stem
+    return _pdf_metadata_title(source) or source.stem
 
 
 @_node(PARSE)

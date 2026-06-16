@@ -3,7 +3,7 @@
 **Project:** Local RAG system over technical documentation — Neo4j knowledge graph + hybrid retrieval
 **Author:** (drafted with Claude Code)
 **Date:** 2026-06-15
-**Status:** Draft v2.8 — for review
+**Status:** Draft v2.10 — for review
 **Sources of truth:**
 - `ingestion_pipeline_diagram.html` — write path (7-stage ingestion)
 - `rag_pipeline_diagram.html` — read path (query → answer)
@@ -16,6 +16,10 @@
 > **v2.5:** consolidated logging into a first-class **§5.8 NFR-LOG** (configurable level/format/destination, rotation, redaction); added `LOG_*` config keys.
 > **v2.6:** locked the query read-path build decisions — **D16** (per-unit retrieval loop + weighted-RRF merge) and **D17** (RRF at synthesis, shared helper); added the **§4.0a graph topology diagram**; noted the `stage_timings_ms` parallel-write reducer (FR-Q0.3). The per-`query_class` weight matrix (D10/D16) and the FR-Q3.4 confidence-formula weights remain **TBD (implementation)** — mechanism locked, constants pending (NFR-MAINT-2).
 > **v2.7:** **query read-path implemented + the two TBDs fixed.** The D10/D16 per-`query_class`×retriever weight matrix and the FR-Q3.4 composite-confidence term weights are now documented constants (in `rag/query/fusion.py` and `rag/query/nodes.py` respectively; see D16/FR-Q2.6 and FR-Q3.4); added the `RRF_K`=60 fusion constant (D16/D17). Added the `clarification_question` state field (FR-Q0.3/Q1.5), produced by `refine_query` and surfaced by `resume_query.py`. All 15 node bodies, the `stage_timings_ms` reducer, the shared RRF helper, and the `query.py` / `resume_query.py` CLIs are built.
+> **v2.10:** **fixed document title resolution (FR-2.7).** Because parsing runs from a private temp file (FR-2.5), Docling's `doc.name` was the `rag_ingest_*` temp stem, so any PDF without an on-page TITLE element got a junk title. New order: TITLE element → embedded PDF `/Title` (via pypdfium2, a Docling dep) → file stem. Backfilled the already-ingested *Java: The Complete Reference* document in the graph in place (hash-matched, single-property `SET d.title` — no re-ingest, citations read `d.title` live).
+>
+> **v2.9:** **calibrated `ESCALATE_CONFIDENCE_THRESHOLD` against the real corpus** (Java: The Complete Reference + OpenText Documentum CM manuals, ~5.3k chunks) via `calibrate_confidence.py` over 25 labeled queries. Answerable (n=17) scored 0.639–0.799; escalate (n=8) scored 0.000–0.120 — **cleanly separable**, so `CONFIDENCE_WEIGHTS` needs no re-weighting. Default lowered **0.40 → 0.38** (the midpoint of the empty 0.12–0.64 gap; 100% balanced accuracy). This **resolves the prior caveat** that BGE over-escalates — that was an artifact of the tiny synthetic corpus, not the real one. Updated FR-Q3.4, FR-Q3.5, §2.5 schema, `.env.example`.
+>
 > **v2.8:** added **Docling PDF memory & cost controls** to bound parse-time memory on very large PDFs (motivated by a 99 MB / ~1300-page born-digital book OOM-ing with `std::bad_alloc`): `OCR_ENABLED` (FR-2.3e), `PDF_MAX_PAGES` and `PDF_RENDER_DPI` (FR-2.8) — wired through `config.py` → `docling_client.build_converter` → `nodes.py::parse`. New config keys added to the §2.5 schema and `.env.example`. **Defaults preserve prior behavior** (OCR on, no page cap, scale 1.0); the primary large-PDF mitigation is `OCR_ENABLED=false`.
 
 ---
@@ -233,7 +237,7 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 | `EMBED_BATCH_SIZE` | `100` | FR-6.2 |
 | `TAG_CONFIDENCE_THRESHOLD` | `0.5` | FR-4.7 |
 | `REFINE_CONFIDENCE_THRESHOLD` | `0.6` | FR-Q1.4 |
-| `ESCALATE_CONFIDENCE_THRESHOLD` | `0.4` | FR-Q3.5 |
+| `ESCALATE_CONFIDENCE_THRESHOLD` | `0.38` | FR-Q3.5 (calibrated v2.9) |
 | `PER_RETRIEVER_K` | `25` | D11 / FR-Q2.6 |
 | `RETRIEVE_TOP_K` | `50` | D11 / FR-Q2.6 |
 | `RERANK_TOP_K` | `10` | D11 / FR-Q3.3 |
@@ -280,7 +284,7 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 - **FR-2.4** Return a `DoclingDocument` tree with typed elements: headings, paragraphs, tables, lists, warnings.
 - **FR-2.5** Write raw bytes to a temp file for parsing; **delete temp file immediately after parse** (success or failure).
 - **FR-2.6** Parse failure (corrupt, unsupported encoding, zero content) → **parse-error terminal**, logging the Docling error.
-- **FR-2.7** Success → store tree, `title`, `page_count`.
+- **FR-2.7** Success → store tree, `title`, `page_count`. **Title resolution (v2.10):** an on-page Docling **TITLE element** → the embedded **PDF `/Title` metadata** (read locally via pypdfium2, a Docling dependency — no egress) → the **original file stem**. Docling's `doc.name` is deliberately *not* used: because parsing runs from the FR-2.5 private temp file, `doc.name` is always the `rag_ingest_*` temp stem and would produce meaningless titles.
 - **FR-2.8** **Parse resource controls (PDF only).** Two configurable bounds limit memory/time on very large PDFs without changing default behavior:
   - **FR-2.8a** `PDF_MAX_PAGES` (default `0` = no limit). When `N > 0`, only the first `N` pages are parsed (applied as Docling `convert(..., page_range=(1, N))`); pages beyond the cap are not parsed. Applies to PDF input only.
   - **FR-2.8b** `PDF_RENDER_DPI` (default `72`, Docling's default → `images_scale = DPI/72 = 1.0`, unchanged behavior). Lower DPI (e.g. `48`) shrinks per-page bitmaps to relieve memory pressure during preprocessing.
@@ -490,8 +494,8 @@ flowchart TD
 - **FR-Q3.3** Output the **Top-`RERANK_TOP_K` (default 10)** re-ranked chunks with scores into state (configurable, D11).
 
 **assess_confidence**
-- **FR-Q3.4** Derive a composite confidence signal from cross-encoder scores using: top-score magnitude, average of top-3, and the score gap between rank-1 and rank-2. For decomposed queries the signal **pools the rerank scores across units** (this node runs before the synthesis-time RRF, so it cannot depend on the final fused order — D17). The composite **weighting (FIXED v2.7, `rag/query/nodes.py::CONFIDENCE_WEIGHTS`):** `composite = 0.5·top + 0.3·avg_top3 + 0.2·gap`, where `top` is the max rerank score, `avg_top3` the mean of the top three, and `gap` the rank1−rank2 difference — each term ∈ [0,1] (rerank scores are sigmoid-normalized), so `composite` ∈ [0,1], comparable to `ESCALATE_CONFIDENCE_THRESHOLD` (0.4). Documented constant (NFR-MAINT-2).
-- **FR-Q3.5** Route: **composite confidence `< 0.4` → `escalate`**; **`≥ 0.4` → `synthesize_answer`**.
+- **FR-Q3.4** Derive a composite confidence signal from cross-encoder scores using: top-score magnitude, average of top-3, and the score gap between rank-1 and rank-2. For decomposed queries the signal **pools the rerank scores across units** (this node runs before the synthesis-time RRF, so it cannot depend on the final fused order — D17). The composite **weighting (FIXED v2.7, `rag/query/nodes.py::CONFIDENCE_WEIGHTS`):** `composite = 0.5·top + 0.3·avg_top3 + 0.2·gap`, where `top` is the max rerank score, `avg_top3` the mean of the top three, and `gap` the rank1−rank2 difference — each term ∈ [0,1] (rerank scores are sigmoid-normalized), so `composite` ∈ [0,1], comparable to `ESCALATE_CONFIDENCE_THRESHOLD` (0.38, calibrated v2.9). Documented constant (NFR-MAINT-2).
+- **FR-Q3.5** Route: **composite confidence `< 0.38` → `escalate`**; **`≥ 0.38` → `synthesize_answer`**. (Default calibrated 2026-06-16 against the real corpus via `calibrate_confidence.py` — answerable/escalate buckets separated cleanly [0.12 vs 0.64], 0.38 is the gap midpoint; v2.9.)
 
 **escalate (Human-in-the-loop)**
 - **FR-Q3.6** LangGraph escalation node triggered when composite confidence `< 0.4`; surfaces the low-confidence result for expert review **before** any answer is returned. State persisted; resumable via the shared resume-CLI by `thread_id` (D14).

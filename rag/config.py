@@ -86,7 +86,7 @@ class AppConfig(BaseSettings):
     embed_batch_size: int = 100             # FR-6.2
     tag_confidence_threshold: float = 0.5   # FR-4.7
     refine_confidence_threshold: float = 0.6  # FR-Q1.4
-    escalate_confidence_threshold: float = 0.4  # FR-Q3.5
+    escalate_confidence_threshold: float = 0.38  # FR-Q3.5 (calibrated 2026-06-16, real corpus)
     per_retriever_k: int = 25               # D11 / FR-Q2.6
     retrieve_top_k: int = 50                # D11 / FR-Q2.6
     rerank_top_k: int = 10                  # D11 / FR-Q3.3
