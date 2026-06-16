@@ -194,11 +194,18 @@ def parse(state: IngestionState) -> dict:
     # (NFR-SEC-6); raw bytes never leave the device (FR-2.1, local-only Docling).
     fd, temp_name = tempfile.mkstemp(suffix=src.suffix.lower(), prefix="rag_ingest_")
     temp_path = Path(temp_name)
+    config = get_config()
+    # Optional page cap (config): parse only the first N pages of a PDF (0 = all).
+    # Bounds memory/time on very large PDFs; page_range is PDF-only in Docling.
+    convert_kwargs: dict[str, Any] = {}
+    if config.pdf_max_pages > 0 and src.suffix.lower() == ".pdf":
+        convert_kwargs["page_range"] = (1, config.pdf_max_pages)
+        logger.info("PDF page cap active: parsing pages 1-%s", config.pdf_max_pages)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(src.read_bytes())
         # FR-2.1/2.2/2.3 local Docling (DocLayNet + TableFormer + EasyOCR, GPU).
-        result = build_converter(get_config()).convert(str(temp_path))
+        result = build_converter(config).convert(str(temp_path), **convert_kwargs)
     except Exception as exc:  # noqa: BLE001 — any parse failure → terminal (FR-2.6)
         logger.error("Docling parse raised", exc_info=True)
         return _terminal(IngestStatus.PARSE_ERROR, f"parse failed: {exc}")

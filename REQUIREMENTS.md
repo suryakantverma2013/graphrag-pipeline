@@ -3,7 +3,7 @@
 **Project:** Local RAG system over technical documentation — Neo4j knowledge graph + hybrid retrieval
 **Author:** (drafted with Claude Code)
 **Date:** 2026-06-15
-**Status:** Draft v2.7 — for review
+**Status:** Draft v2.8 — for review
 **Sources of truth:**
 - `ingestion_pipeline_diagram.html` — write path (7-stage ingestion)
 - `rag_pipeline_diagram.html` — read path (query → answer)
@@ -16,6 +16,7 @@
 > **v2.5:** consolidated logging into a first-class **§5.8 NFR-LOG** (configurable level/format/destination, rotation, redaction); added `LOG_*` config keys.
 > **v2.6:** locked the query read-path build decisions — **D16** (per-unit retrieval loop + weighted-RRF merge) and **D17** (RRF at synthesis, shared helper); added the **§4.0a graph topology diagram**; noted the `stage_timings_ms` parallel-write reducer (FR-Q0.3). The per-`query_class` weight matrix (D10/D16) and the FR-Q3.4 confidence-formula weights remain **TBD (implementation)** — mechanism locked, constants pending (NFR-MAINT-2).
 > **v2.7:** **query read-path implemented + the two TBDs fixed.** The D10/D16 per-`query_class`×retriever weight matrix and the FR-Q3.4 composite-confidence term weights are now documented constants (in `rag/query/fusion.py` and `rag/query/nodes.py` respectively; see D16/FR-Q2.6 and FR-Q3.4); added the `RRF_K`=60 fusion constant (D16/D17). Added the `clarification_question` state field (FR-Q0.3/Q1.5), produced by `refine_query` and surfaced by `resume_query.py`. All 15 node bodies, the `stage_timings_ms` reducer, the shared RRF helper, and the `query.py` / `resume_query.py` CLIs are built.
+> **v2.8:** added **Docling PDF memory & cost controls** to bound parse-time memory on very large PDFs (motivated by a 99 MB / ~1300-page born-digital book OOM-ing with `std::bad_alloc`): `OCR_ENABLED` (FR-2.3e), `PDF_MAX_PAGES` and `PDF_RENDER_DPI` (FR-2.8) — wired through `config.py` → `docling_client.build_converter` → `nodes.py::parse`. New config keys added to the §2.5 schema and `.env.example`. **Defaults preserve prior behavior** (OCR on, no page cap, scale 1.0); the primary large-PDF mitigation is `OCR_ENABLED=false`.
 
 ---
 
@@ -217,6 +218,13 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 | `OCR_ENGINE` | `easyocr` | locked (D6) |
 | `MODEL_CACHE_DIR` / `HF_HOME` | *(platform default)* | local weight cache (FR-S0.3) |
 
+**Parsing / Docling** (PDF memory & cost controls; defaults preserve prior behavior)
+| Var | Default | Source |
+|-----|---------|--------|
+| `OCR_ENABLED` | `true` | FR-2.3e — `false` skips OCR for large born-digital PDFs |
+| `PDF_MAX_PAGES` | `0` | FR-2.8 — `0` = all pages; N>0 parses only the first N (PDF only) |
+| `PDF_RENDER_DPI` | `72` | FR-2.8 — page rasterization DPI; `images_scale = DPI/72`; lower = less memory |
+
 **Tunables** (defaults from the diagrams / decisions)
 | Var | Default | Source |
 |-----|---------|--------|
@@ -268,10 +276,14 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
   - **FR-2.3b** EasyOCR SHALL run on the **GPU (CUDA)** by default, reusing the shared CUDA PyTorch build; it MUST fall back to CPU if no CUDA device is available (consistent with FR-Q3.2a).
   - **FR-2.3c** EasyOCR model weights (detection + recognition, ~100 MB) are downloaded on first run and cached locally; subsequent runs require no re-download.
   - **FR-2.3d** The OCR engine SHALL be selected explicitly in Docling pipeline options (EasyOCR), not left to Docling's auto/default selection.
+  - **FR-2.3e** OCR SHALL be toggleable via `OCR_ENABLED` (default `true`; sets Docling `PdfPipelineOptions.do_ocr`). Born-digital PDFs (with a real text layer) do not require OCR, which is the heaviest, most memory-hungry parse stage; setting `OCR_ENABLED=false` is the primary mitigation for large text PDFs that exhaust memory during parse (Docling `std::bad_alloc`). Default `true` preserves correctness on scanned input.
 - **FR-2.4** Return a `DoclingDocument` tree with typed elements: headings, paragraphs, tables, lists, warnings.
 - **FR-2.5** Write raw bytes to a temp file for parsing; **delete temp file immediately after parse** (success or failure).
 - **FR-2.6** Parse failure (corrupt, unsupported encoding, zero content) → **parse-error terminal**, logging the Docling error.
 - **FR-2.7** Success → store tree, `title`, `page_count`.
+- **FR-2.8** **Parse resource controls (PDF only).** Two configurable bounds limit memory/time on very large PDFs without changing default behavior:
+  - **FR-2.8a** `PDF_MAX_PAGES` (default `0` = no limit). When `N > 0`, only the first `N` pages are parsed (applied as Docling `convert(..., page_range=(1, N))`); pages beyond the cap are not parsed. Applies to PDF input only.
+  - **FR-2.8b** `PDF_RENDER_DPI` (default `72`, Docling's default → `images_scale = DPI/72 = 1.0`, unchanged behavior). Lower DPI (e.g. `48`) shrinks per-page bitmaps to relieve memory pressure during preprocessing.
 
 ### 3.3 Stage 3 — Structural Chunking
 - **FR-3.1** Tables → exactly one chunk each (structure preserved, never split).

@@ -53,11 +53,19 @@ def build_converter(config: AppConfig) -> "DocumentConverter":
     )
     # D6: EasyOCR engine selected explicitly (FR-2.3d), GPU by default (FR-2.3b).
     ocr_options = EasyOcrOptions(use_gpu=use_cuda)
+    # OCR + page-render DPI are config-controlled memory/cost levers: disabling OCR
+    # and/or lowering DPI lets large born-digital PDFs parse without std::bad_alloc.
+    images_scale = max(config.pdf_render_dpi, 1) / 72.0  # Docling scale: dpi/72
     pipeline_options = PdfPipelineOptions(
-        do_ocr=True,                     # FR-2.3 enable OCR for scanned/image PDFs
+        do_ocr=config.ocr_enabled,       # FR-2.3 OCR for scanned/image PDFs (toggle)
         ocr_options=ocr_options,
         do_table_structure=True,         # FR-2.2 TableFormer
         accelerator_options=accelerator,
+        images_scale=images_scale,
+    )
+    logger.info(
+        "Docling converter: ocr=%s device=%s render_dpi=%s",
+        config.ocr_enabled, "cuda" if use_cuda else "cpu", config.pdf_render_dpi,
     )
     # Images share the PDF pipeline in Docling; apply the same OCR options to both.
     fmt = PdfFormatOption(pipeline_options=pipeline_options)

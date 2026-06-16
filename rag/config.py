@@ -65,6 +65,21 @@ class AppConfig(BaseSettings):
         description="optional Hugging Face token for higher download rate limits",
     )
 
+    # --- Parsing / Docling (PDF memory & cost controls) ---
+    # OCR is needed only for scanned/image PDFs. Born-digital PDFs (with a real
+    # text layer) do NOT need it, and OCR is the heaviest, most memory-hungry
+    # parse stage — disabling it lets large text PDFs parse without exhausting
+    # memory (std::bad_alloc on big books). Default ON for correctness on scanned
+    # input (FR-2.3); set OCR_ENABLED=false for large born-digital PDFs.
+    ocr_enabled: bool = True
+    # Parse only the first N pages (0 = no limit). Bounds memory/time on very
+    # large PDFs (e.g. a 1000+ page book); pages beyond the cap are not parsed.
+    pdf_max_pages: int = 0
+    # Page rasterization resolution. Docling's images_scale = dpi / 72; lower DPI
+    # = smaller page bitmaps = less memory during preprocess. 72 = Docling default
+    # (unchanged behavior); drop to e.g. 48 to relieve memory pressure.
+    pdf_render_dpi: int = 72
+
     # --- Tunables (defaults from the diagrams / decisions) ---
     chunk_max_tokens: int = 512             # FR-3.4
     chunk_overlap_tokens: int = 50          # FR-3.4

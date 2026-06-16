@@ -278,6 +278,16 @@ All settings come from environment variables (loaded from `.env`). A single type
 | `HF_TOKEN` | *(blank)* | Optional HF download token. |
 | `HF_HOME` | `./.model_cache` | Local weight cache. |
 
+**Parsing / Docling (PDF memory & cost controls)**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OCR_ENABLED` | `true` | OCR for scanned/image PDFs. Set `false` for large **born‑digital** PDFs (those with a real text layer) — OCR is the heaviest, most memory‑hungry parse stage and is unnecessary there. Biggest lever against `std::bad_alloc` on large books. |
+| `PDF_MAX_PAGES` | `0` | Parse only the first N pages of a PDF (`0` = all). Bounds memory/time on very large documents. |
+| `PDF_RENDER_DPI` | `72` | Page rasterization resolution (Docling `images_scale = dpi/72`). Lower (e.g. `48`) = smaller page bitmaps = less memory. `72` is the Docling default. |
+
+> **Ingesting a large text PDF (e.g. a 1000+ page book).** The default OCR pipeline rasterizes every page and can exhaust memory (`std::bad_alloc`). For a born‑digital PDF, set `OCR_ENABLED=false` — that alone usually fixes it. For extreme cases, also cap pages (`PDF_MAX_PAGES=200`) or lower `PDF_RENDER_DPI`. Splitting the document into chapters and ingesting each separately remains the most robust approach for very large books.
+
 **Tunables**
 
 | Variable | Default | Meaning |
@@ -553,6 +563,7 @@ Stated honestly, per the project's standards.
 | Bootstrap fails on Postgres | Service not running / role missing | Start the native Postgres service; create the `langgraph` role+db; keep `CHECKPOINT_DB_URI` in sync; see `POSTGRES_SETUP.md` |
 | Ingest exits `3` immediately | Document already ingested (same bytes) | Expected — re‑ingestion isn't supported. Ingest a changed file as new. |
 | Ingest exits `1` with `INTAKE_ERROR` | Path missing/unreadable or unsupported format | Use a supported format (PDF, DOCX, HTML, XML, TXT, MD) and a readable path. |
+| Ingest **hangs** on a large PDF; log shows `std::bad_alloc` repeating per page | Out of memory parsing a huge document with OCR on (e.g. a 1000+ page book) | Stop it (`Ctrl+C` — atomic design means no partial graph data). Set `OCR_ENABLED=false` for born-digital PDFs; optionally `PDF_MAX_PAGES=N` and/or lower `PDF_RENDER_DPI`. Or split the document into chapters. See [§6](#6-configuration-reference). |
 | Ingest exits `1` with `EMBED_ERROR` | OpenAI outage/quota after 3 retries | No graph write occurred; fix the OpenAI issue and re‑submit the file. |
 | Query exits `4` (clarification/escalation) | Low‑confidence refinement or retrieval | `python resume_query.py <thread_id>` and follow the prompts. |
 | Query escalates too often | Strict re‑ranker on a small corpus | Ingest more representative content; recalibrate via `calibrate_confidence.py` ([§16](#16-calibrating-confidence-thresholds)). |
