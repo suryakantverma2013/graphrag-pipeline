@@ -1,3 +1,4 @@
+
 # graphrag-pipeline — Local Graph RAG (Ingestion + Query)
 
 > A local, single-user **Retrieval-Augmented Generation** system over technical documentation, built on **LangGraph** and a **Neo4j knowledge graph**, with hybrid retrieval (BM25 + vector + graph), a **local GPU cross-encoder re-ranker**, and durable human-in-the-loop checkpointing.
@@ -14,8 +15,6 @@
 This project turns a folder of technical documents (product manuals, spec sheets, troubleshooting guides) into a queryable knowledge base, then answers natural-language questions against it **with citations**. It is deliberately **hybrid**: heavy reasoning and embeddings run in the cloud (OpenAI), while document parsing, OCR, and cross-encoder re-ranking run **locally on the GPU** — minimizing data egress and per-query cost.
 
 📖 **Full documentation:** [**User Manual**](./USER_MANUAL.md) · [**Requirements & design spec**](./REQUIREMENTS.md) (decisions D1–D17, every NFR)
-
----
 
 ## Demo
 
@@ -37,10 +36,6 @@ This project turns a folder of technical documents (product manuals, spec sheets
 
 ![Query run — cited answer](./docs/demo-query.png)
 
-> _Screenshots coming soon. To regenerate: run the two commands in [Quick start](#quick-start) and capture the terminal output._
-
----
-
 ## Why this is interesting
 
 This is not a "embed-and-cosine" RAG demo. The engineering choices are the point:
@@ -55,10 +50,9 @@ This is not a "embed-and-cosine" RAG demo. The engineering choices are the point
 - 🚦 **Composite-confidence escalation gate** — escalates to a human instead of returning a confident-sounding weak answer.
 - 🔧 **No magic numbers** — every tunable is externalized to `.env` with a documented schema.
 
----
-
 ## Architecture
 
+---
 ```
 ┌──────────────── Laptop (Windows 11, Python 3.13) ──────────────────┐
 │   Python process                       Bolt :7687                   │
@@ -71,9 +65,11 @@ This is not a "embed-and-cosine" RAG demo. The engineering choices are the point
 └──────────────────┼──────────────────────────────────────────────────┘
                    ▼   OpenAI API (gpt-4o-mini · text-embedding-3-small)
 ```
+---
 
 ### Ingestion flow (write path)
 
+---
 ```mermaid
 flowchart LR
     A([ingest_document.py]) --> B[Intake<br/>SHA-256 dedup]
@@ -86,9 +82,11 @@ flowchart LR
     G --> H[Atomic<br/>Neo4j write]
     H --> I[Receipt +<br/>summary]
 ```
+---
 
 ### Query flow (read path)
 
+---
 ```mermaid
 flowchart LR
     A([query.py]) --> P[refine /<br/>decompose]
@@ -103,10 +101,9 @@ flowchart LR
     E -.-> S
     S --> Z([Answer])
 ```
+---
 
 > Step-by-step descriptions of every node are in the [User Manual](./USER_MANUAL.md#7-ingestion-flow-write-path).
-
----
 
 ## Tech stack
 
@@ -122,12 +119,11 @@ flowchart LR
 | Checkpoint store | Postgres (native on-prem) |
 | Local ML runtime | PyTorch CUDA build on an NVIDIA RTX 4090 |
 
----
-
 ## Quick start
 
 > **Prerequisites:** Windows 11, Python 3.13, an NVIDIA CUDA GPU, Docker Desktop, a native Postgres install, and an OpenAI API key. Full setup (incl. the CUDA-torch caveat) is in the [User Manual §4](./USER_MANUAL.md#4-installation--setup).
 
+---
 ```powershell
 # 1. Environment
 py -3.13 -m venv .venv ; .\.venv\Scripts\Activate.ps1
@@ -145,7 +141,6 @@ python setup_models.py              # prints "environment ready"
 python ingest_document.py samples\acme_pump_manual.md
 python query.py "What is the rated flow of the pump?"
 ```
-
 ---
 
 ## Command reference
@@ -159,8 +154,6 @@ python query.py "What is the rated flow of the pump?"
 | `python resume_query.py <thread_id>` | Resume query at clarification/escalation | `0`/`1`/`4` |
 | `python calibrate_confidence.py [queries.txt]` | Offline harness to tune the escalate threshold | `0` ok |
 
----
-
 ## Documentation
 
 | Document | What's in it |
@@ -170,13 +163,9 @@ python query.py "What is the rated flow of the pump?"
 | [NEO4J_SETUP.md](./NEO4J_SETUP.md) | Neo4j (Docker) provisioning. |
 | [POSTGRES_SETUP.md](./POSTGRES_SETUP.md) | Postgres (native on-prem) provisioning. |
 
----
-
 ## Scope & honest caveats
 
 Built for a **single user, from the CLI**. Out of scope by design: multi-user concurrency, a web UI/REST API, auth, document deletion, and in-place re-ingestion. The cross-encoder is strict, so on the small sample corpus queries escalate more often than on a real corpus — the included `calibrate_confidence.py` is how you retune the threshold. See the [full caveats](./USER_MANUAL.md#13-known-limitations--caveats) before relying on it.
-
----
 
 ## License
 
