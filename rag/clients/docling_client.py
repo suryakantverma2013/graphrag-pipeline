@@ -36,8 +36,9 @@ def _use_cuda(config: AppConfig) -> bool:
     return False
 
 
-def build_converter(config: AppConfig) -> "DocumentConverter":
-    """Build a DocumentConverter with EasyOCR + table structure on the device."""
+def build_converter(config: AppConfig, *, do_ocr: bool) -> "DocumentConverter":
+    """Build a DocumentConverter with table structure on the device, OCR per
+    `do_ocr` (resolved by the caller from config.resolve_ocr() / detection)."""
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
         AcceleratorDevice,
@@ -52,20 +53,23 @@ def build_converter(config: AppConfig) -> "DocumentConverter":
         device=AcceleratorDevice.CUDA if use_cuda else AcceleratorDevice.CPU
     )
     # D6: EasyOCR engine selected explicitly (FR-2.3d), GPU by default (FR-2.3b).
-    ocr_options = EasyOcrOptions(use_gpu=use_cuda)
-    # OCR + page-render DPI are config-controlled memory/cost levers: disabling OCR
-    # and/or lowering DPI lets large born-digital PDFs parse without std::bad_alloc.
+    # Languages are configurable (FR-2.3g) so non-Latin scans work.
+    ocr_options = EasyOcrOptions(lang=config.ocr_language_list, use_gpu=use_cuda)
+    # OCR + page-render DPI are memory/cost levers: disabling OCR and/or lowering
+    # DPI lets large born-digital PDFs parse without std::bad_alloc. `do_ocr` is
+    # resolved per-document by the caller (FR-2.3e).
     images_scale = max(config.pdf_render_dpi, 1) / 72.0  # Docling scale: dpi/72
     pipeline_options = PdfPipelineOptions(
-        do_ocr=config.ocr_enabled,       # FR-2.3 OCR for scanned/image PDFs (toggle)
+        do_ocr=do_ocr,                   # FR-2.3 OCR for scanned/image PDFs
         ocr_options=ocr_options,
         do_table_structure=True,         # FR-2.2 TableFormer
         accelerator_options=accelerator,
         images_scale=images_scale,
     )
     logger.info(
-        "Docling converter: ocr=%s device=%s render_dpi=%s",
-        config.ocr_enabled, "cuda" if use_cuda else "cpu", config.pdf_render_dpi,
+        "Docling converter: ocr=%s langs=%s device=%s render_dpi=%s",
+        do_ocr, config.ocr_language_list if do_ocr else None,
+        "cuda" if use_cuda else "cpu", config.pdf_render_dpi,
     )
     # Images share the PDF pipeline in Docling; apply the same OCR options to both.
     fmt = PdfFormatOption(pipeline_options=pipeline_options)
@@ -109,7 +113,9 @@ def warm_up(config: AppConfig) -> None:
 
     image_path = _make_smoke_image()
     try:
-        result = build_converter(config).convert(image_path)  # FR-S0.4
+        # Warm-up MUST exercise OCR regardless of OCR_ENABLED so EasyOCR weights
+        # are fetched and smoke-tested on the device (FR-S0.3/S0.4).
+        result = build_converter(config, do_ocr=True).convert(image_path)  # FR-S0.4
         chars = len(result.document.export_to_text())
         logger.info("Docling smoke OK (extracted_chars=%d)", chars)
     finally:

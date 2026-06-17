@@ -16,7 +16,8 @@ hf_home/
 .huggingface/
 
 # ----- Runtime outputs / logs -----------------------------------------------
-ingestion_log.json
+ingestion_log.json      # legacy cumulative log (pre-v2.16); kept ignored
+ingestion_logs/         # per-run audit files (one JSON per ingestion run)
 logs/
 *.log
 # Regenerated each run by calibrate_confidence.py (keep calibration_queries.txt, not this)

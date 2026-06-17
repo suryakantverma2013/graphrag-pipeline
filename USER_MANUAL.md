@@ -64,7 +64,7 @@ These are the engineering decisions worth highlighting — the things that make 
 |---|---|
 | **LangGraph state machines, end to end** | Both pipelines are explicit, typed `StateGraph`s with conditional routing. Every stage is an independently testable node with pydantic‑typed I/O. |
 | **Durable checkpointing + resumable human‑in‑the‑loop** | A run that pauses (low‑confidence tags, ambiguous query, low‑confidence retrieval) persists full state to Postgres and resumes later by `thread_id` — surviving process exit and even a Postgres restart. |
-| **Atomic, all‑or‑nothing graph writes** | The entire document is written to Neo4j in a single transaction. A failure leaves **zero** partial data; the file is safe to re‑submit. |
+| **Atomic, all‑or‑nothing graph writes** | The document is written to Neo4j in bounded per‑batch transactions (so a huge book can't overflow a single transaction and wedge the store). A failure triggers a compensating delete, leaving **zero** partial data; the file is safe to re‑submit. |
 | **Exactly‑once ingestion via SHA‑256 dedup** | The document hash is its canonical id. Re‑submitting the same bytes terminates cleanly as a duplicate with **no OpenAI calls** (zero cost). |
 | **Structure‑aware chunking** | Tables, lists, and safety warnings are each kept as one unfragmented chunk; prose is packed to 512 tokens with 50‑token sentence‑boundary overlap. Section paths are carried as chunk context. |
 | **Hybrid retrieval, always parallel** | BM25 (lexical), vector (semantic), and graph (relational) retrieval **all** run for every query. The query class re‑weights their contributions; it never disables a retriever. |
@@ -73,7 +73,7 @@ These are the engineering decisions worth highlighting — the things that make 
 | **Composite confidence + escalation gate** | A weighted signal (top score, avg top‑3, rank‑1/rank‑2 gap) decides whether to answer or escalate to a human, rather than returning a confident‑sounding weak answer. |
 | **Closed iiRDS vocabularies** | `lifecycle_phase` and `information_type` are validated against config‑defined enums; out‑of‑vocabulary values are normalized or rejected. `product`/`component` are open free‑text, `MERGE`d for cross‑document dedup. |
 | **No magic numbers** | Every tunable (chunk size, thresholds, top‑K, loop caps, model names, devices) is externalized to `.env` with a documented schema and a shipped `.env.example`. |
-| **Structured JSON logging + audit trail** | Structured logs (console + rotating file) carry `thread_id`/pipeline/stage on every record; secrets and full payloads are never logged. A separate append‑only `ingestion_log.json` and a Neo4j `IngestionRecord` form the durable audit trail. |
+| **Structured JSON logging + audit trail** | Structured logs (console + a **per‑run** file under `logs/`) carry `thread_id`/pipeline/stage on every record; secrets and full payloads are never logged. A separate **per‑run** JSON file under `ingestion_logs/` and a Neo4j `IngestionRecord` form the durable audit trail. |
 | **Explicit bootstrap** | A one‑time `setup_models.py` asserts CUDA, downloads/caches all local weights, smoke‑tests each on the GPU, and creates Neo4j indexes + Postgres tables — so first ingest/query needs no downloads and fails fast if the environment is wrong. |
 | **Distinguishable exit codes** | `0` success · `1` error · `3` duplicate · `4` suspended — scriptable and unambiguous. |
 
@@ -283,12 +283,26 @@ All settings come from environment variables (loaded from `.env`). A single type
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OCR_ENABLED` | `true` | OCR for scanned/image PDFs. Set `false` for large **born‑digital** PDFs (those with a real text layer) — OCR is the heaviest, most memory‑hungry parse stage and is unnecessary there. Biggest lever against `std::bad_alloc` on large books. |
+| `OCR_ENABLED` | `auto` | OCR control. **`auto`** (default) classifies each PDF from its own text layer and turns OCR on only for scanned/mixed files — no per-file tuning. `on`/`true` forces OCR everywhere; `off`/`false` disables it (fast path for known born‑digital PDFs; biggest lever against `std::bad_alloc`). |
+| `OCR_LANGUAGES` | `fr,de,es,en` | EasyOCR language codes (comma/space‑separated) used when OCR runs. Default is EasyOCR's Latin set. For non‑Latin scans set e.g. `ch_sim,en`, `ja,en`, `ar,en`, `ru,en`, `hi,en`. Must be **script‑compatible** (English mixes with anything; you can't mix e.g. Chinese + Arabic) or EasyOCR errors at model load. |
 | `PDF_MAX_PAGES` | `0` | Parse only the first N pages of a PDF (`0` = all). Bounds memory/time on very large documents. |
 | `PDF_RENDER_DPI` | `72` | Page rasterization resolution (Docling `images_scale = dpi/72`). Lower (e.g. `48`) = smaller page bitmaps = less memory. `72` is the Docling default. **Note:** does *not* fix `std::bad_alloc` on very large PDFs — that ceiling is page-count-driven, not DPI-driven (use `PDF_PARSE_BATCH_PAGES`). |
-| `PDF_PARSE_BATCH_PAGES` | `100` | Parse large PDFs in N-page slices, freeing memory between slices so Docling never accumulates past its `std::bad_alloc` ceiling — captures the **whole** document. `0` = single-shot convert (legacy). This is the real fix for big books. |
+| `PDF_PARSE_BATCH_PAGES` | `100` | Slice size for **born‑digital** PDFs (no OCR). Parsing in N-page slices frees memory between slices so Docling never accumulates past its `std::bad_alloc` ceiling — captures the **whole** document. `0` = single-shot convert (legacy). |
+| `PDF_PARSE_BATCH_PAGES_OCR` | `25` | Slice size used when OCR is active (scanned/mixed). OCR is far heavier per page, so a smaller slice is used. Chosen automatically based on the OCR decision. |
 
-> **Ingesting a large text PDF (e.g. a 600+ page book).** Two independent memory pressures: (1) **OCR** rasterizes/recognizes every page — for a born‑digital PDF set `OCR_ENABLED=false` (it's unnecessary and the heaviest stage). (2) Docling **accumulates memory within a single `convert()` call** and hits `std::bad_alloc` at a fixed page depth (~127 pages here) *regardless of DPI*. The fix for (2) is `PDF_PARSE_BATCH_PAGES` (default `100`): the PDF is parsed in page-range slices that free memory between them, so the **entire** book is captured — chunking stays continuous across slices. A 610‑page book that previously lost ~half its pages now ingests all 610 with `failed_pages=0`. (Lowering `PDF_RENDER_DPI` does *not* help case (2); `PDF_MAX_PAGES` only truncates.)
+> **OCR is now automatic.** With `OCR_ENABLED=auto` (the default) you no longer decide born‑digital vs scanned per file — the `parse` node classifies each PDF from its own text layer and turns OCR on only when it's actually scanned (or mixed). It also picks the slice size automatically: `PDF_PARSE_BATCH_PAGES` (100) for born‑digital, `PDF_PARSE_BATCH_PAGES_OCR` (25) when OCR runs. The run logs the decision, e.g. `pdf kind=digital — …` / `pdf kind=scanned — … needs OCR`.
+>
+> **How the classifier decides** (`rag/ingestion/pdf_kind.py`): it samples up to 1000 pages across the document; a page with a real text layer counts as *text*, a text‑less page whose image covers ≥80% of it counts as *scanned*, and blank/partial‑figure pages are ignored. `digital` = ~all text, `scanned` = ~all full‑page images, `mixed` = a real blend (OCR'd so the scanned pages aren't lost). This is why a born‑digital book full of diagrams is **not** mis‑flagged as scanned.
+>
+> **Forcing it** (rarely needed — e.g. a misclassification): set `OCR_ENABLED=on` or `off` in `.env`, or per‑run:
+> ```powershell
+> $env:OCR_ENABLED="on"      # or "off"
+> python .\ingest_document.py ".\samples\<book>.pdf"
+> Remove-Item Env:OCR_ENABLED   # reset after
+> ```
+> You can preview the verdict without ingesting: `python .\detect_pdf_kind.py --json ".\samples\<book>.pdf"`.
+>
+> **Memory note (still relevant):** Docling accumulates memory *within one `convert()` call* and hits `std::bad_alloc` at a fixed page depth (~127 pages here) regardless of DPI or OCR. Slicing (`PDF_PARSE_BATCH_PAGES` / `…_OCR`) is the fix — the PDF is parsed in page‑range slices that free memory between them, capturing the **whole** document (chunking stays continuous across slices). Lowering `PDF_RENDER_DPI` does **not** help this; `PDF_MAX_PAGES` only truncates. Verified: a 1,882‑page born‑digital book ingests all pages with `failed_pages=0`; a scanned book is much slower and its OCR'd text contains occasional recognition errors.
 
 **Tunables**
 
@@ -297,6 +311,7 @@ All settings come from environment variables (loaded from `.env`). A single type
 | `CHUNK_MAX_TOKENS` | `512` | Max tokens per prose chunk. |
 | `CHUNK_OVERLAP_TOKENS` | `50` | Sentence‑boundary overlap between prose chunks. |
 | `EMBED_BATCH_SIZE` | `100` | Chunks per embedding API call. |
+| `NEO4J_WRITE_BATCH_CHUNKS` | `250` | Chunks per Neo4j write transaction. Bounds transaction size so a very large book can't overflow a single transaction (which wedged the store). A failed write is compensated by deleting the partial document. Lower it if writes still strain on huge chunks. |
 | `TAG_CONFIDENCE_THRESHOLD` | `0.5` | Below → suspend for human tag review. |
 | `REFINE_CONFIDENCE_THRESHOLD` | `0.6` | Below → request clarification. |
 | `ESCALATE_CONFIDENCE_THRESHOLD` | `0.38` | Below → escalate retrieval for expert review. Calibrated against the real corpus (see §17). |
@@ -312,7 +327,7 @@ All settings come from environment variables (loaded from `.env`). A single type
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`. |
 | `LOG_FORMAT` | `json` | `json` or `text`. |
-| `LOG_DIR` | `./logs` | Rotating‑file location (git‑ignored). |
+| `LOG_DIR` | `./logs` | Per‑run log file location (git‑ignored). Each run writes `<pipeline>_<UTCstamp>_<pid>.log`. |
 
 > **Critical invariant (RISK‑C).** The query embedding model, dimension, and similarity metric **must** match ingestion exactly (`text-embedding-3-small`, 1536‑dim, cosine). They are read from one shared config key precisely so they cannot drift. Changing the embedding model requires a full re‑index — the existing graph's vectors become incompatible.
 
@@ -336,9 +351,9 @@ flowchart TD
     E -->|tagging failed · non-blocking| G[Embedding · OpenAI<br/>text-embedding-3-small · 1536-d<br/>batches of 100]
     F -. resume thread_id .-> G
     G -->|all retries fail| ERR3([Exit 1 · EMBED_ERROR<br/>no graph write])
-    G --> H[Neo4j Write · single atomic tx<br/>Document + Chunks + iiRDS nodes]
-    H -->|tx failure| ERR4([Exit 1 · WRITE_ERROR<br/>full rollback])
-    H --> I[Receipt<br/>ingestion_log.json + IngestionRecord]
+    G --> H[Neo4j Write · batched txns<br/>Document + Chunks + iiRDS nodes]
+    H -->|write failure| ERR4([Exit 1 · WRITE_ERROR<br/>compensating delete])
+    H --> I[Receipt<br/>ingestion_logs/ per-run file + IngestionRecord]
     I --> OK([Exit 0 · COMPLETED<br/>summary: title · chunks · cost · time])
 
     classDef interrupt fill:#fde,stroke:#c39,stroke-width:2px;
@@ -350,15 +365,15 @@ flowchart TD
 1. **Intake.** Accepts one file path. Validates it exists, is readable, and the format ∈ {PDF, DOCX, HTML, XML, TXT, MD}. Computes the **SHA‑256 of the raw bytes** as the canonical `Document` id and checks Neo4j for an existing document with that hash.
    - **Duplicate** → terminate `DUPLICATE` (exit `3`), no OpenAI calls. Re‑ingestion is not supported; ingest an updated source as a new file.
    - **Unsupported/unreadable** → `INTAKE_ERROR` (exit `1`).
-2. **Docling parse (local, GPU).** Raw bytes are written to an owner‑only temp file, parsed fully locally with DocLayNet (layout) + TableFormer (tables), with **EasyOCR** for scanned/image PDFs. The temp file is deleted immediately after parse (success or failure). A parse failure or zero‑text result → `PARSE_ERROR` (exit `1`).
+2. **Docling parse (local, GPU).** Raw bytes are written to an owner‑only temp file, parsed fully locally with DocLayNet (layout) + TableFormer (tables), with **EasyOCR** for scanned/image PDFs. When `OCR_ENABLED=auto` (default), the PDF is first classified from its text layer (`pdf_kind=…` is logged) and OCR — plus the slice size — is chosen automatically; `on`/`off` force it. The temp file is deleted immediately after parse (success or failure). A parse failure or zero‑text result → `PARSE_ERROR` (exit `1`).
 3. **Structural chunking.** Walks the document tree tracking a section‑header stack. **Tables** → one Markdown chunk each. Consecutive **list items** → one chunk. Leading **safety warnings** (WARNING/CAUTION/DANGER/NOTICE/IMPORTANT) → one unfragmented chunk. **Prose** → packed to 512 tokens with 50‑token sentence‑boundary overlap. Each chunk carries its section path, document title, content type, position, and token count.
 4. **iiRDS tagging.** **One** `gpt-4o-mini` call per document over the first 3000 chars extracts `product`, `components`, `lifecycle_phase`, `information_type`, and `language`, plus a `confidence` score. Closed enums are normalized; out‑of‑vocabulary values become `None`. Retries 3× with exponential backoff.
    - `confidence ≥ 0.5` → continue to embedding.
    - `confidence < 0.5` → **suspend** at human review (see [§10](#10-human-in-the-loop-operations)).
    - Total tagging failure → store empty tags and **continue** (non‑blocking degradation), bypassing review.
 5. **Embedding.** OpenAI `text-embedding-3-small` (1536‑dim), in batches of 100. Each chunk's text is prefixed with `[Document: <title>] [Section: <path>]`. Retries 3×; if all fail → `EMBED_ERROR` (exit `1`) with **no Neo4j write** (the file is safe to re‑submit). Token count and estimated USD cost are tracked.
-6. **Neo4j write (atomic).** The **entire** document is written in a **single transaction**: the `Document` node, all `Chunk`s (with embeddings set via `db.create.setNodeVectorProperty`), and the iiRDS nodes (`Product`, `Component`, `LifecyclePhase`, `InformationType`) `MERGE`d for cross‑document dedup, plus their relationships. Any failure rolls back completely → `WRITE_ERROR` (exit `1`), zero partial data, safe to retry.
-7. **Receipt.** Dual write: appends a record to `ingestion_log.json` **and** creates an `(:IngestionRecord)-[:INGESTION_OF]->(:Document)` in the graph. A receipt failure is a **warning only** — the document is already durable, so the run still exits `0`.
+6. **Neo4j write (atomic via batching + compensation).** The `Document` node and the iiRDS nodes (`Product`, `Component`, `LifecyclePhase`, `InformationType`, `MERGE`d for cross‑document dedup) are written first, then all `Chunk`s (with embeddings set via `db.create.setNodeVectorProperty`) and their `HAS_CHUNK` relationships are written in **batches of `NEO4J_WRITE_BATCH_CHUNKS` (default 250), one transaction per batch**. This avoids a single document-sized transaction — on a large book that reached ~240k store commands and Neo4j failed to apply it, wedging the database. Strict single-transaction atomicity is replaced by **compensation**: any failure deletes the document and every committed chunk → `WRITE_ERROR` (exit `1`), zero partial data, safe to retry. (If the compensating delete itself fails, e.g. the DB is down, it's logged and a re‑ingest reports the file as a `DUPLICATE` until cleaned up.)
+7. **Receipt.** Dual write: writes a **per‑run** JSON file `ingestion_logs/ingestion_log_<UTCstamp>_<thread8>_<source>.json` **and** creates an `(:IngestionRecord)-[:INGESTION_OF]->(:Document)` in the graph. Each run gets its own file (no shared/appended log). A receipt failure is a **warning only** — the document is already durable, so the run still exits `0`.
 8. **Completion.** Prints the title, chunk count, embedding cost, wall‑clock time, and `thread_id`; exits `0`.
 
 **Graph data model produced:**
@@ -507,8 +522,8 @@ Three distinct, coexisting records — don't confuse them:
 
 | Record | Location | Purpose |
 |---|---|---|
-| **Application log** | console + rotating file under `LOG_DIR` (`./logs`) | Operational/diagnostic. Structured JSON by default; every record carries `thread_id`, pipeline (`ingest`/`query`), and stage. Stage entry/exit, status, retries, and errors (with stack traces) are logged. |
-| **Ingestion audit trail** | `ingestion_log.json` (repo root, append‑only) | Durable per‑document record: hash, file name, title, timestamp, chunk count, tokens, embedding cost, stage timings, status, low‑confidence flag. |
+| **Application log** | console + a **per‑run** file under `LOG_DIR` (`./logs/<pipeline>_<UTCstamp>_<pid>.log`) | Operational/diagnostic. One file per run; structured JSON by default; every record carries `thread_id`, pipeline (`ingest`/`query`), and stage. Stage entry/exit, status, retries, and errors (with stack traces) are logged. Size‑rotates within a long run. |
+| **Ingestion audit trail** | `ingestion_logs/` (one JSON file per run) | Durable per‑run record: hash, file name, title, timestamp, chunk count, tokens, embedding cost, stage timings, status, low‑confidence flag. |
 | **Run state** | Postgres checkpointer, keyed by `thread_id` | Full LangGraph state per run; enables resume and post‑hoc inspection. Survives process/service restarts. |
 
 **Logging guarantees:**
@@ -616,15 +631,19 @@ Stated honestly, per the project's standards.
 | Bootstrap fails on Postgres | Service not running / role missing | Start the native Postgres service; create the `langgraph` role+db; keep `CHECKPOINT_DB_URI` in sync; see `POSTGRES_SETUP.md` |
 | Ingest exits `3` immediately | Document already ingested (same bytes) | Expected — re‑ingestion isn't supported. Ingest a changed file as new. |
 | Ingest exits `1` with `INTAKE_ERROR` | Path missing/unreadable or unsupported format | Use a supported format (PDF, DOCX, HTML, XML, TXT, MD) and a readable path. |
-| Ingest log shows `std::bad_alloc` repeating per page; summary says `⚠ INCOMPLETE: N pages failed` | Docling exhausts memory mid-parse on a very large PDF (accumulates within one `convert()` call) | Keep `PDF_PARSE_BATCH_PAGES` at its default `100` (or lower it) so the PDF is parsed in slices — this captures the whole book. Also set `OCR_ENABLED=false` for born-digital PDFs. Lowering `PDF_RENDER_DPI` will *not* help here. Re-ingest after changing. See [§6](#6-configuration-reference). |
+| Ingest exits `1` with `INTAKE_ERROR: password-protected (encrypted) PDF is not supported` | The PDF requires a password to open | Remove the password — re‑save or print to an unprotected PDF (e.g. open in a viewer and "Print → Save as PDF") — then re‑ingest. Password‑protected PDFs can't be parsed. |
+| Scanned PDF OCRs to **garbage / wrong characters** | OCR language set doesn't match the document's script (default is Latin `fr,de,es,en`) | Set `OCR_LANGUAGES` to the right EasyOCR codes (e.g. `ch_sim,en`, `ja,en`, `ar,en`, `ru,en`) and re‑ingest. Keep the set script‑compatible. See [§6](#6-configuration-reference). |
+| Ingest log shows `std::bad_alloc` repeating per page; summary says `⚠ INCOMPLETE: N pages failed` | Docling exhausts memory mid-parse on a very large PDF (accumulates within one `convert()` call) | Keep `PDF_PARSE_BATCH_PAGES` at its default `100` (or lower it) so the PDF is parsed in slices — this captures the whole book. Lowering `PDF_RENDER_DPI` will *not* help here. Re-ingest after changing. See [§6](#6-configuration-reference). |
+| Big PDF ingests but `chunk` reports only **1–2 chunks** / `total_tokens` tiny; run **suspends with tag confidence `0.00`** | A **scanned/image PDF** was parsed without OCR — no text layer to extract. With `OCR_ENABLED=auto` this should self-correct; it indicates a misclassification (or `OCR_ENABLED=off`). | Abandon the review (`Ctrl+C` — nothing is written yet). Check the logged `pdf kind=…`; if it misread a scanned book as digital, force it: re-ingest with **`OCR_ENABLED=on`**. Confirm with `python detect_pdf_kind.py --json <file>`. See [§6](#6-configuration-reference). |
 | Ingest exits `1` with `EMBED_ERROR` | OpenAI outage/quota after 3 retries | No graph write occurred; fix the OpenAI issue and re‑submit the file. |
+| Neo4j errors `Failed to apply transaction` / `database has encountered a critical error, and needs to be restarted`; afterwards even reads fail | A single oversized write transaction (a huge book before batching) failed the store-apply and wedged the database | This is what `NEO4J_WRITE_BATCH_CHUNKS` (default `250`) prevents — keep it set, and lower it for books with very large chunks. To recover a wedged store: `docker compose down -v && docker compose up -d`, then `python setup_models.py` to recreate indexes, then re‑ingest. (See `NEO4J_SETUP.md` for the volume reset.) |
 | Query exits `4` (clarification/escalation) | Low‑confidence refinement or retrieval | `python resume_query.py <thread_id>` and follow the prompts. |
 | Query escalates too often | Strict re‑ranker on a small/unrepresentative corpus | Ingest more representative content; recalibrate via `calibrate_confidence.py` ([§16](#16-calibrating-confidence-thresholds)). The default `0.38` was calibrated on the real corpus. |
 | HF model download resets mid‑download | Flaky Hugging Face endpoint | Re‑run `setup_models.py`; the downloader retries. Optionally set `HF_TOKEN`. |
 | Garbled characters in console (e.g. em‑dash) | Windows cp1252 stdout display only | Cosmetic — the data stored in Neo4j is correct UTF‑8. |
 | A retriever returns nothing | Empty BM25/vector/graph result | Expected and safe — weighted RRF degrades gracefully (NFR‑REL‑9). |
 
-For deeper diagnosis, set `LOG_LEVEL=DEBUG` and inspect the rotating log under `./logs` (filter by `thread_id`), or inspect the run state in Postgres by `thread_id`.
+For deeper diagnosis, set `LOG_LEVEL=DEBUG` and inspect that run's log file under `./logs` (one file per run, named `<pipeline>_<UTCstamp>_<pid>.log`; the printed `thread_id` also tags every record), or inspect the run state in Postgres by `thread_id`.
 
 ---
 

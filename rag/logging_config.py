@@ -2,7 +2,9 @@
 
 Single shared configuration used by every component (NFR-LOG-1); `print()` is
 not used for diagnostics. Emits structured JSON by default (NFR-LOG-2) to both
-the console and a size-rotating file under `LOG_DIR` (NFR-LOG-3). Every record
+the console and a per-run file under `LOG_DIR` (NFR-LOG-3): each process
+invocation writes its own `<pipeline>_<UTCstamp>_<pid>.log`, so runs never share
+a file; the size-based rotation still caps a single very long run. Every record
 carries `thread_id`, `pipeline` and `stage` for correlation (NFR-LOG-7), set via
 context variables so node code does not thread them through call signatures.
 
@@ -16,7 +18,9 @@ import contextvars
 import json
 import logging
 import logging.handlers
+import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -68,8 +72,12 @@ class _JsonFormatter(logging.Formatter):
 _TEXT_FMT = "%(asctime)s %(levelname)-7s [%(pipeline)s/%(stage)s %(thread_id)s] %(name)s: %(message)s"
 
 
-def setup_logging(config: AppConfig) -> None:
-    """Configure root logging from config. Idempotent (safe to call once/proc)."""
+def setup_logging(config: AppConfig, pipeline: str | None = None) -> None:
+    """Configure root logging from config. Idempotent (safe to call once/proc).
+
+    `pipeline` (e.g. 'ingest'/'query'/'bootstrap') only labels the per-run log
+    filename; the live `pipeline` correlation field is still set via set_context.
+    """
     root = logging.getLogger()
     if getattr(root, "_rag_configured", False):
         return
@@ -82,9 +90,15 @@ def setup_logging(config: AppConfig) -> None:
     log_dir = Path(config.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # One log file per run (per process invocation): named by pipeline + UTC
+    # start time + PID so sequential/concurrent runs never share a file
+    # (NFR-LOG-3). RotatingFileHandler still caps a single very long run.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_log_name = f"{pipeline or 'rag'}_{stamp}_{os.getpid()}.log"
+
     console = logging.StreamHandler()
     file_handler = logging.handlers.RotatingFileHandler(
-        log_dir / "rag.log", maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8"
+        log_dir / run_log_name, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8"
     )
     for handler in (console, file_handler):
         handler.setFormatter(formatter)

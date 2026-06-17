@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # --- Embedding invariants (NFR-REL-8 / FR-Q0.5) ------------------------------
@@ -66,12 +66,23 @@ class AppConfig(BaseSettings):
     )
 
     # --- Parsing / Docling (PDF memory & cost controls) ---
-    # OCR is needed only for scanned/image PDFs. Born-digital PDFs (with a real
-    # text layer) do NOT need it, and OCR is the heaviest, most memory-hungry
-    # parse stage — disabling it lets large text PDFs parse without exhausting
-    # memory (std::bad_alloc on big books). Default ON for correctness on scanned
-    # input (FR-2.3); set OCR_ENABLED=false for large born-digital PDFs.
-    ocr_enabled: bool = True
+    # OCR is needed only for scanned/image PDFs and is the heaviest, most
+    # memory-hungry parse stage. Tri-state (FR-2.3/2.3e), stored normalized to
+    # 'auto' | 'on' | 'off' — consume it via resolve_ocr()/ocr_mode, never as a
+    # bare bool:
+    #   'auto' (default) — the parse node classifies each PDF from its own text
+    #                      layer (rag/ingestion/pdf_kind.py) and enables OCR only
+    #                      for 'scanned'/'mixed' files; no per-file hand-tuning.
+    #   'on'  (or true)  — force OCR for every file.
+    #   'off' (or false) — never OCR (fast path for known born-digital PDFs).
+    ocr_enabled: str = "auto"
+    # OCR languages (EasyOCR codes) used when OCR runs. Comma/space-separated;
+    # the default matches EasyOCR's built-in Latin set. EasyOCR requires the set
+    # to be script-compatible (English combines with anything, but you cannot mix
+    # e.g. Chinese + Arabic) — an incompatible set raises at model load. For
+    # non-Latin scans set e.g. OCR_LANGUAGES="ch_sim,en" / "ja,en" / "ar,en" /
+    # "ru,en" / "hi,en". Consume via ocr_language_list.
+    ocr_languages: str = "fr,de,es,en"
     # Parse only the first N pages (0 = no limit). Bounds memory/time on very
     # large PDFs (e.g. a 1000+ page book); pages beyond the cap are not parsed.
     pdf_max_pages: int = 0
@@ -86,11 +97,25 @@ class AppConfig(BaseSettings):
     # chunked contiguously — capturing the WHOLE document. 0 = single convert
     # (legacy). 100 leaves headroom under the observed ceiling.
     pdf_parse_batch_pages: int = 100
+    # Slice size used when OCR is active. OCR (rasterize + two neural models per
+    # page) is far heavier per page than text extraction, so scanned/mixed PDFs
+    # use a smaller slice. The parse node picks this vs pdf_parse_batch_pages from
+    # the resolved OCR decision (FR-2.8c / FR-2.3e).
+    pdf_parse_batch_pages_ocr: int = 25
 
     # --- Tunables (defaults from the diagrams / decisions) ---
     chunk_max_tokens: int = 512             # FR-3.4
     chunk_overlap_tokens: int = 50          # FR-3.4
     embed_batch_size: int = 100             # FR-6.2
+    # Chunk-write batch size for the Neo4j write (FR-7.1). The per-document graph
+    # write was originally ONE transaction; on very large books it grew to ~240k
+    # store commands and Neo4j failed to apply it to the store ("Failed to apply
+    # transaction"), wedging the database. Chunks are now written in batches of
+    # this many per transaction so no single transaction can grow large enough to
+    # fail; the Document node + iiRDS edges are written first and a failed run is
+    # compensated by deleting the partial data, preserving the no-partial-data
+    # guarantee (FR-7.8). Lower this if very large chunks still strain a write.
+    neo4j_write_batch_chunks: int = 250
     tag_confidence_threshold: float = 0.5   # FR-4.7
     refine_confidence_threshold: float = 0.6  # FR-Q1.4
     escalate_confidence_threshold: float = 0.38  # FR-Q3.5 (calibrated 2026-06-16, real corpus)
@@ -104,6 +129,39 @@ class AppConfig(BaseSettings):
     log_level: str = "INFO"                 # NFR-LOG-4
     log_format: str = "json"                # json | text (NFR-LOG-2)
     log_dir: str = "./logs"                 # rotating-file location (NFR-LOG-3)
+
+    @field_validator("ocr_enabled", mode="before")
+    @classmethod
+    def _normalize_ocr_enabled(cls, v: object) -> str:
+        """Accept the documented tri-state plus bool-ish aliases, normalize to
+        'auto' | 'on' | 'off'. Unrecognized values fall back to 'auto' (safe)."""
+        s = str(v).strip().lower()
+        if s in {"on", "true", "1", "yes", "y", "enable", "enabled"}:
+            return "on"
+        if s in {"off", "false", "0", "no", "n", "disable", "disabled"}:
+            return "off"
+        return "auto"
+
+    @property
+    def ocr_mode(self) -> str:
+        """Normalized OCR intent: 'auto' | 'on' | 'off'."""
+        return self.ocr_enabled
+
+    @property
+    def ocr_language_list(self) -> list[str]:
+        """OCR_LANGUAGES parsed to a list of EasyOCR codes (never empty)."""
+        raw = self.ocr_languages.replace(";", ",").replace(" ", ",")
+        parts = [p.strip() for p in raw.split(",")]
+        return [p for p in parts if p] or ["en"]
+
+    def resolve_ocr(self, pdf_kind: str | None) -> bool:
+        """Effective do_ocr for a file (FR-2.3e). 'on'/'off' force the decision;
+        'auto' enables OCR only for a 'scanned' or 'mixed' PDF kind."""
+        if self.ocr_enabled == "on":
+            return True
+        if self.ocr_enabled == "off":
+            return False
+        return pdf_kind in {"scanned", "mixed"}
 
     @property
     def embedding_dimensions(self) -> int:

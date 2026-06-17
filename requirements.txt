@@ -63,3 +63,6 @@ numpy>=2
 
 # ----- Dev / security (optional) ---------------------------------------------
 # pip-audit                       # dependency vulnerability scan (NFR-SEC-3)
+pypdf>=4                          # dev/test only: build encrypted PDFs to test the
+                                  # FR-1.2a intake rejection (runtime detection uses
+                                  # pypdfium2, a Docling dep — pypdf is NOT used at runtime)

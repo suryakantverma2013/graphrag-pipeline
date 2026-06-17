@@ -75,9 +75,11 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 # rather than in the env schema (verify against current OpenAI pricing).
 EMBED_USD_PER_1M_TOKENS = 0.02
 
-# Append-only ingestion audit trail (FR-8.1a / NFR-OBS-4); distinct from the app
-# log (NFR-LOG-8). Repo-root relative; git-ignored.
-INGESTION_LOG_PATH = Path("ingestion_log.json")
+# Per-run ingestion audit trail (FR-8.1a / NFR-OBS-4); distinct from the app log
+# (NFR-LOG-8). Each ingestion run writes ONE JSON file into this directory, named
+# by timestamp + thread_id + source stem, so runs never overwrite each other and
+# the directory sorts chronologically. Repo-root relative; git-ignored.
+INGESTION_LOG_DIR = Path("ingestion_logs")
 
 
 # --- Per-process clients / tokenizer (NFR-PERF-4) ----------------------------
@@ -141,6 +143,31 @@ def _terminal(status: IngestStatus, message: str) -> dict:
 
 
 # --- Stage 1: Intake (FR-1.x) ------------------------------------------------
+def _pdf_requires_password(path: Path) -> bool:
+    """True only when a PDF can't be opened without a password (encrypted).
+
+    Other open failures (corrupt, etc.) return False — they're left for the
+    parse stage to report. This exists only to give a clear, early message for
+    the common 'password-protected' case (FR-1.2a). Detection is by the pdfium
+    error message so it's robust across pypdfium2 versions.
+    """
+    try:
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+    except ImportError:
+        return False
+    try:
+        doc = pdfium.PdfDocument(str(path))
+        doc.close()
+        return False
+    except Exception as exc:  # noqa: BLE001 — classify by error, not type
+        # Precise signal: pdfium's password error code; fall back to the message
+        # text for any version that doesn't surface err_code.
+        if getattr(exc, "err_code", None) == pdfium_c.FPDF_ERR_PASSWORD:
+            return True
+        return "password" in str(exc).lower()
+
+
 @_node(INTAKE)
 def intake(state: IngestionState) -> dict:
     config = get_config()
@@ -161,6 +188,15 @@ def intake(state: IngestionState) -> dict:
         return _terminal(IngestStatus.INTAKE_ERROR, f"could not read file: {exc}")
     if not raw:
         return _terminal(IngestStatus.INTAKE_ERROR, f"empty file (zero bytes): {path}")
+
+    # FR-1.2a password-protected (encrypted) PDFs can't be parsed — fail here
+    # with a clear, actionable message instead of a generic downstream parse error.
+    if suffix == ".pdf" and _pdf_requires_password(path):
+        return _terminal(
+            IngestStatus.INTAKE_ERROR,
+            f"password-protected (encrypted) PDF is not supported: {path.name}. "
+            "Remove the password (e.g. re-save or print to an unprotected PDF) and re-ingest.",
+        )
 
     # FR-1.3 SHA-256 of raw bytes = canonical Document id.
     doc_hash = hashlib.sha256(raw).hexdigest()
@@ -276,14 +312,31 @@ def parse(state: IngestionState) -> dict:
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(src.read_bytes())
+        # FR-2.3e: resolve OCR per-document so OCR_ENABLED never needs hand-tuning
+        # per file. In 'auto' mode (default) a PDF is classified from its own text
+        # layer (digital vs scanned/mixed) and OCR is enabled only when needed;
+        # 'on'/'off' force it. Non-PDF inputs never OCR. Detection reads the temp
+        # file written above. OCR is heavy per page, so it also selects the
+        # smaller OCR slice size; both feed an effective per-document config.
+        pdf_kind = None
+        if is_pdf and config.ocr_mode == "auto":
+            from .pdf_kind import analyze
+
+            kind_result = analyze(str(temp_path))
+            pdf_kind = kind_result.kind
+            logger.info("pdf kind=%s — %s", pdf_kind, kind_result.reason)
+        do_ocr = config.resolve_ocr(pdf_kind) if is_pdf else False
+        eff_batch = config.pdf_parse_batch_pages_ocr if do_ocr else config.pdf_parse_batch_pages
+        eff_config = config.model_copy(update={"pdf_parse_batch_pages": eff_batch})
         # Plan slices AFTER writing bytes (page count is read from the temp file).
-        page_ranges = _plan_page_ranges(temp_path, config, is_pdf)
-        if len(page_ranges) > 1:
-            logger.info("PDF parsed in %d page-slice(s) of <=%d pages",
-                        len(page_ranges), config.pdf_parse_batch_pages)
+        page_ranges = _plan_page_ranges(temp_path, eff_config, is_pdf)
+        n_slices = len(page_ranges)
+        if n_slices > 1:
+            logger.info("parsing PDF in %d page-slice(s) of <=%d pages (ocr=%s)",
+                        n_slices, eff_batch, do_ocr)
         # FR-2.1/2.2/2.3 local Docling (DocLayNet + TableFormer + EasyOCR, GPU).
-        converter = build_converter(config)
-        for page_range in page_ranges:
+        converter = build_converter(eff_config, do_ocr=do_ocr)
+        for i, page_range in enumerate(page_ranges, start=1):
             kwargs: dict[str, Any] = {"page_range": page_range} if page_range else {}
             result = converter.convert(str(temp_path), **kwargs)
             if result.status == ConversionStatus.FAILURE:
@@ -291,6 +344,11 @@ def parse(state: IngestionState) -> dict:
                 return _terminal(IngestStatus.PARSE_ERROR, f"Docling reported FAILURE for {src.name}{where}")
             failed_pages += len(getattr(result, "errors", []) or [])
             docs.append(result.document)
+            # Per-slice progress (FR-2.8c): without this a long OCR run looks hung,
+            # since the convert loop is otherwise silent until "parse ok".
+            if n_slices > 1:
+                span = f" pages {page_range[0]}-{page_range[1]}" if page_range else ""
+                logger.info("parsed slice %d/%d%s", i, n_slices, span)
             del result  # release this slice's transient buffers before the next
     except Exception as exc:  # noqa: BLE001 — any parse failure → terminal (FR-2.6)
         logger.error("Docling parse raised", exc_info=True)
@@ -668,10 +726,13 @@ _IIRDS_RELS = (
 )
 
 
-def _write_tx(tx, doc_id, params, chunks, tag_values) -> None:
-    """All graph writes for one document in a single transaction (FR-7.1)."""
+def _write_doc_tx(tx, doc_id, params, tag_values) -> None:
+    """Write the Document node + its iiRDS relationships in one transaction.
+
+    Small and bounded (one doc + a handful of MERGE'd tag nodes). Runs FIRST so
+    the chunk batches below have an anchor Document to MATCH (FR-7.1/7.3/7.5).
+    """
     tx.run(_DOC_CYPHER, doc_id=doc_id, **params)
-    tx.run(_CHUNK_CYPHER, doc_id=doc_id, chunks=chunks)
     for label, rel, key, is_list in _IIRDS_RELS:
         names = tag_values.get(key)
         names = names if is_list else ([names] if names else [])
@@ -682,6 +743,37 @@ def _write_tx(tx, doc_id, params, chunks, tag_values) -> None:
                 f"MERGE (d)-[:{rel}]->(n)",
                 doc_id=doc_id, name=name,
             )
+
+
+def _write_chunks_tx(tx, doc_id, chunks) -> None:
+    """Write ONE batch of chunks + their HAS_CHUNK edges in a single transaction.
+
+    Called once per batch (config.neo4j_write_batch_chunks) so no single
+    transaction is large enough to fail the store-apply that wedged the DB.
+    """
+    tx.run(_CHUNK_CYPHER, doc_id=doc_id, chunks=chunks)
+
+
+def _delete_partial_write(session, doc_id) -> None:
+    """Compensating cleanup for a failed multi-batch write (FR-7.8).
+
+    The per-document write is no longer a single transaction, so a mid-write
+    failure can leave the Document plus some already-committed chunk batches.
+    Delete them so a failed run still leaves ZERO partial data (all-or-nothing).
+    Chunks are removed in bounded sub-transactions so the cleanup itself can never
+    become an oversized transaction. iiRDS nodes are shared across documents
+    (MERGE'd), so DETACH DELETE of the Document removes only this document's edges
+    to them, never the shared nodes themselves.
+    """
+    session.run(
+        "MATCH (:Document {id: $doc_id})-[:HAS_CHUNK]->(c:Chunk) "
+        "CALL { WITH c DETACH DELETE c } IN TRANSACTIONS OF 1000 ROWS",
+        doc_id=doc_id,
+    ).consume()
+    session.run(
+        "MATCH (d:Document {id: $doc_id}) DETACH DELETE d",
+        doc_id=doc_id,
+    ).consume()
 
 
 @_node(NEO4J_WRITE)
@@ -695,17 +787,34 @@ def neo4j_write(state: IngestionState) -> dict:
         "chunk_count": len(state.chunks),
         "language": tags.get("language"),
     }
+    batch_size = max(1, config.neo4j_write_batch_chunks)
+    chunks = state.chunks
     try:
         with _neo4j().driver.session(database=config.neo4j_database) as session:
-            # execute_write runs the unit in one transaction; any exception rolls
-            # the whole thing back → zero partial data (FR-7.1/7.8, NFR-REL-1).
-            session.execute_write(_write_tx, state.doc_hash, params, state.chunks, tags)
-    except Exception as exc:  # noqa: BLE001 — FR-7.8 rollback → terminal, retryable
-        logger.error("Neo4j write failed (rolled back)", exc_info=True)
+            # The whole document used to be ONE transaction (FR-7.1). On very large
+            # books that single transaction reached ~240k store commands and Neo4j
+            # failed to apply it to the store, wedging the database. We now write
+            # the Document + iiRDS edges first, then the chunks in bounded batches
+            # (one transaction each) so no single transaction can grow large enough
+            # to fail. Atomicity is preserved by COMPENSATION: any failure deletes
+            # whatever was committed, leaving zero partial data (FR-7.8, NFR-REL-1).
+            session.execute_write(_write_doc_tx, state.doc_hash, params, tags)
+            for start in range(0, len(chunks), batch_size):
+                session.execute_write(_write_chunks_tx, state.doc_hash, chunks[start : start + batch_size])
+    except Exception as exc:  # noqa: BLE001 — FR-7.8 compensate → terminal, retryable
+        logger.error("Neo4j write failed; compensating (deleting partial data)", exc_info=True)
+        try:
+            with _neo4j().driver.session(database=config.neo4j_database) as session:
+                _delete_partial_write(session, state.doc_hash)
+        except Exception:  # noqa: BLE001 — cleanup best-effort; surface the original cause
+            logger.error("compensating cleanup failed for doc=%s (manual cleanup may be needed)",
+                         state.doc_hash[:12], exc_info=True)
         return _terminal(IngestStatus.WRITE_ERROR, f"Neo4j write failed: {exc}")
 
     chunk_ids = [c["id"] for c in state.chunks]
-    logger.info("neo4j write ok: doc=%s chunks=%d", state.doc_hash[:12], len(chunk_ids))
+    n_batches = (len(chunks) + batch_size - 1) // batch_size
+    logger.info("neo4j write ok: doc=%s chunks=%d batches=%d",
+                state.doc_hash[:12], len(chunk_ids), n_batches)
     return {
         "neo4j_doc_id": state.doc_hash,
         "neo4j_chunk_ids": chunk_ids,
@@ -714,17 +823,25 @@ def neo4j_write(state: IngestionState) -> dict:
 
 
 # --- Stage 7: Receipt (FR-8.x) ----------------------------------------------
-def _append_ingestion_log(record: dict) -> None:
-    """Append one record to the JSON audit trail (FR-8.1a)."""
-    existing: list = []
-    if INGESTION_LOG_PATH.exists():
-        try:
-            existing = json.loads(INGESTION_LOG_PATH.read_text(encoding="utf-8")) or []
-        except (json.JSONDecodeError, OSError):
-            logger.warning("ingestion_log.json unreadable; starting a fresh log")
-            existing = []
-    existing.append(record)
-    INGESTION_LOG_PATH.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+def _safe_slug(text: str, maxlen: int = 40) -> str:
+    """Filesystem-safe, truncated slug for embedding the source name in a log
+    filename (keeps alnum / dot / dash / underscore)."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")
+    return cleaned[:maxlen] or "doc"
+
+
+def _write_ingestion_log(record: dict, thread_id: str, stamp: str) -> Path:
+    """Write a fresh per-run JSON audit file (FR-8.1a).
+
+    One file per ingestion run (not an appended cumulative log), named by
+    timestamp + thread_id + source stem so runs never overwrite each other and
+    the directory sorts chronologically. Returns the path written.
+    """
+    INGESTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    slug = _safe_slug(Path(record["file_name"]).stem)
+    path = INGESTION_LOG_DIR / f"ingestion_log_{stamp}_{thread_id[:8]}_{slug}.json"
+    path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 @_node(RECEIPT)
@@ -732,7 +849,8 @@ def receipt(state: IngestionState) -> dict:
     config = get_config()
     meta = state.embeddings_meta or {}
     low_confidence = state.confidence is not None and state.confidence < config.tag_confidence_threshold
-    ingested_at = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    ingested_at = now.isoformat()
 
     record = {
         "doc_hash": state.doc_hash,
@@ -750,9 +868,10 @@ def receipt(state: IngestionState) -> dict:
     # FR-8.2 either receipt write failing is a warning only — the document is
     # already durable in the graph, so the run still succeeds.
     try:
-        _append_ingestion_log(record)
+        log_path = _write_ingestion_log(record, state.thread_id, now.strftime("%Y%m%dT%H%M%SZ"))
+        logger.info("ingestion log written: %s", log_path)
     except OSError:
-        logger.warning("could not append ingestion_log.json (continuing)", exc_info=True)
+        logger.warning("could not write ingestion log (continuing)", exc_info=True)
     try:
         with _neo4j().driver.session(database=config.neo4j_database) as session:
             session.run(

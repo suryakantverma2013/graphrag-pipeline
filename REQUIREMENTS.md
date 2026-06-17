@@ -3,7 +3,7 @@
 **Project:** Local RAG system over technical documentation — Neo4j knowledge graph + hybrid retrieval
 **Author:** (drafted with Claude Code)
 **Date:** 2026-06-15
-**Status:** Draft v2.13 — for review
+**Status:** Draft v2.18 — for review
 **Sources of truth:**
 - `ingestion_pipeline_diagram.html` — write path (7-stage ingestion)
 - `rag_pipeline_diagram.html` — read path (query → answer)
@@ -16,6 +16,16 @@
 > **v2.5:** consolidated logging into a first-class **§5.8 NFR-LOG** (configurable level/format/destination, rotation, redaction); added `LOG_*` config keys.
 > **v2.6:** locked the query read-path build decisions — **D16** (per-unit retrieval loop + weighted-RRF merge) and **D17** (RRF at synthesis, shared helper); added the **§4.0a graph topology diagram**; noted the `stage_timings_ms` parallel-write reducer (FR-Q0.3). The per-`query_class` weight matrix (D10/D16) and the FR-Q3.4 confidence-formula weights remain **TBD (implementation)** — mechanism locked, constants pending (NFR-MAINT-2).
 > **v2.7:** **query read-path implemented + the two TBDs fixed.** The D10/D16 per-`query_class`×retriever weight matrix and the FR-Q3.4 composite-confidence term weights are now documented constants (in `rag/query/fusion.py` and `rag/query/nodes.py` respectively; see D16/FR-Q2.6 and FR-Q3.4); added the `RRF_K`=60 fusion constant (D16/D17). Added the `clarification_question` state field (FR-Q0.3/Q1.5), produced by `refine_query` and surfaced by `resume_query.py`. All 15 node bodies, the `stage_timings_ms` reducer, the shared RRF helper, and the `query.py` / `resume_query.py` CLIs are built.
+> **v2.18:** **configurable OCR languages + explicit encrypted-PDF rejection.** (1) `OCR_LANGUAGES` (FR-2.3g, default `fr,de,es,en` = EasyOCR's built-in Latin set) is passed to `EasyOcrOptions(lang=…)`, so non-Latin scans work (e.g. `ch_sim,en`, `ja,en`, `ar,en`, `ru,en`). Comma/space-separated; the set must be script-compatible (EasyOCR raises otherwise). (2) Intake now detects **password-protected (encrypted) PDFs** (FR-1.2a) — via pypdfium2's `FPDF_ERR_PASSWORD`, message fallback — and terminates with a clear "not supported, remove the password" message instead of a generic downstream parse error. Added to §2.5 config schema + `.env.example`.
+>
+> **v2.17:** **per-run application log files (NFR-LOG-3).** The on-disk app log changed from a single shared `logs/rag.log` to **one file per process invocation**, `logs/<pipeline>_<UTCstamp>_<pid>.log` (e.g. `logs/ingest_20260617T131451Z_56432.log`). Named at logging-setup time (before a `thread_id` exists) from the pipeline + UTC start time + PID, so runs never share a file; size-based rotation (10 MB × 5) still caps a single very long run. Mirrors the v2.16 per-run audit-file change. `setup_logging(config, pipeline)` gained the pipeline label; `init_runtime`/`bootstrap` pass it.
+>
+> **v2.16:** **per-run ingestion audit files (FR-8.1a / NFR-OBS-4).** The ingestion audit trail changed from one appended `ingestion_log.json` to **one JSON file per run** under `ingestion_logs/`, named `ingestion_log_<UTCstamp>_<thread8>_<source-stem>.json` (a single record object, not an array). Runs no longer share/rewrite a growing file — they sort chronologically and each is self-contained. The legacy `ingestion_log.json` is left in place (still git-ignored). The Neo4j `IngestionRecord` (FR-8.1b) is unchanged.
+>
+> **v2.15:** **automatic OCR selection per PDF (FR-2.3e/2.3f).** `OCR_ENABLED` became tri-state — `auto` (new default) | `on`/`true` | `off`/`false`. In `auto`, the `parse` node classifies each PDF from its own text layer via a shared classifier (`rag/ingestion/pdf_kind.py`): it samples up to 1000 pages and, for text-less pages, measures image coverage, labelling the file **digital** / **scanned** / **mixed** over *text-vs-scanned* pages only (blank/figure pages excluded, so a born-digital book full of diagrams isn't mis-flagged). OCR is enabled only for scanned/mixed; the OCR slice size (`PDF_PARSE_BATCH_PAGES_OCR`, default 25) is chosen automatically. This removes the per-file `OCR_ENABLED`/`PDF_PARSE_BATCH_PAGES` hand-tuning the `ingest_folder.ps1` wrapper used to do (the wrapper is now a thin batch loop). `detect_pdf_kind.py` is retained as a thin CLI over the same classifier. Added to §2.5 config schema + `.env.example`.
+>
+> **v2.14:** **batched Neo4j write for very large books (FR-7.1/7.8).** The per-document write was a **single transaction** over all chunks; on a large book it reached **~243,658 store commands** and Neo4j **failed to apply it to the store** (`Failed to apply transaction` → `database needs to be restarted`), wedging the DB so even reads failed until the volume was recreated. The write is now split into bounded transactions — `Document` + iiRDS edges first, then chunks in batches of the new `NEO4J_WRITE_BATCH_CHUNKS` (default 250), one transaction each. Strict single-transaction atomicity is replaced by **compensation**: any failure deletes the document + all committed chunks (itself batched via `CALL { … } IN TRANSACTIONS`), preserving the zero-partial-data guarantee (NFR-REL-1). Added to §2.5 config schema + `.env.example`.
+>
 > **v2.13:** **page-range batched parsing for very large PDFs (FR-2.8c).** `PDF_RENDER_DPI` was confirmed insufficient — a 610-page book OOM'd at a fixed ~page-127 depth regardless of DPI (the `std::bad_alloc` accumulation is in Docling's parse backend, not the page bitmaps). New `PDF_PARSE_BATCH_PAGES` (default 100) parses the PDF in page-range slices via repeated `convert(page_range=…)` on a reused converter, freeing memory between slices; `chunk` consumes the ordered slice list with continuous section/position tracking. Verified: the 610-page book now parses all pages (`failed_pages=0`, 7 slices, 2618 chunks vs ~1300 when half was dropped). Added to §2.5 config schema + `.env.example`.
 >
 > **v2.12:** **fixed checkpointer crash on PDF ingest + added partial-parse visibility.** (1) The parsed `DoclingDocument` was held in checkpointed state; the Postgres checkpointer cannot msgpack-serialize it (works for tiny markdown docs via `model_dump`, fails for large PDFs), crashing every PDF ingest at end-of-run with `TypeError: Type is not msgpack serializable: DoclingDocument`. Now passed `parse`→`chunk` via a process-local handoff, never persisted (FR-2.4). (2) Discovered that Docling `PARTIAL_SUCCESS` (pages dropped under memory pressure) was silently reported as a clean ingest — added `parse_failed_pages` tracking, a WARNING, and an `⚠ INCOMPLETE` summary line (FR-2.6a). Verified: 610-page PDF ingests to exit 0 (was crashing), and the summary now flags the ~296 pages Docling dropped.
@@ -161,7 +171,7 @@ The system is **deliberately hybrid**: the expensive generative/embedding models
 | Graph DB / driver | Neo4j (Docker) + official `neo4j` driver (Bolt) |
 | Vector/index helpers (optional) | `neo4j-graphrag` |
 | Rank fusion math | numpy (RRF) |
-| Logging | Python `logging` — structured JSON, console + rotating file (NFR-LOG); separate from the JSON receipt |
+| Logging | Python `logging` — structured JSON, console + per-run file (NFR-LOG); separate from the JSON receipt |
 
 ### 2.3 Pinned Versions (verified compatible, June 2026)
 > **Requirement:** Use the latest patch within each minor line to obtain current security fixes (stakeholder requirement). Pin exact versions in a lockfile and run a vulnerability scan (NFR-SEC-3) before each build. On Python 3.13 the full ML stack (incl. **CUDA GPU wheels**) is available, so none of the 3.14 caveats from v1.0 apply.
@@ -231,10 +241,12 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 **Parsing / Docling** (PDF memory & cost controls; defaults preserve prior behavior)
 | Var | Default | Source |
 |-----|---------|--------|
-| `OCR_ENABLED` | `true` | FR-2.3e — `false` skips OCR for large born-digital PDFs |
+| `OCR_ENABLED` | `auto` | FR-2.3e/2.3f — `auto` detects scanned/mixed PDFs per file; `on`/`true` forces OCR; `off`/`false` skips it |
+| `OCR_LANGUAGES` | `fr,de,es,en` | FR-2.3g — EasyOCR language codes (comma/space-separated) used when OCR runs; must be script-compatible |
 | `PDF_MAX_PAGES` | `0` | FR-2.8 — `0` = all pages; N>0 parses only the first N (PDF only) |
 | `PDF_RENDER_DPI` | `72` | FR-2.8 — page rasterization DPI; `images_scale = DPI/72`; lower = less memory |
-| `PDF_PARSE_BATCH_PAGES` | `100` | FR-2.8c — parse PDFs in N-page slices (frees memory between slices); `0` = single convert |
+| `PDF_PARSE_BATCH_PAGES` | `100` | FR-2.8c — slice size for born-digital PDFs (no OCR); `0` = single convert |
+| `PDF_PARSE_BATCH_PAGES_OCR` | `25` | FR-2.8c/2.3e — smaller slice size used when OCR is active (heavier per page) |
 
 **Tunables** (defaults from the diagrams / decisions)
 | Var | Default | Source |
@@ -242,6 +254,7 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 | `CHUNK_MAX_TOKENS` | `512` | FR-3.4 |
 | `CHUNK_OVERLAP_TOKENS` | `50` | FR-3.4 |
 | `EMBED_BATCH_SIZE` | `100` | FR-6.2 |
+| `NEO4J_WRITE_BATCH_CHUNKS` | `250` | FR-7.1 — chunks per write transaction (bounds tx size; failure compensated by FR-7.8) |
 | `TAG_CONFIDENCE_THRESHOLD` | `0.5` | FR-4.7 |
 | `REFINE_CONFIDENCE_THRESHOLD` | `0.6` | FR-Q1.4 |
 | `ESCALATE_CONFIDENCE_THRESHOLD` | `0.38` | FR-Q3.5 (calibrated v2.9) |
@@ -256,7 +269,7 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 |-----|---------|-------|
 | `LOG_LEVEL` | `INFO` | app log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`); NFR-LOG-4 |
 | `LOG_FORMAT` | `json` | `json` or `text` (NFR-LOG-2) |
-| `LOG_DIR` | `./logs` | rotating-file location, git-ignored (NFR-LOG-3) |
+| `LOG_DIR` | `./logs` | per-run log file location, git-ignored (NFR-LOG-3) |
 
 ---
 
@@ -274,6 +287,7 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 ### 3.1 Stage 1 — Intake
 - **FR-1.1** Accept a single file path; verify it exists and is readable.
 - **FR-1.2** Validate format ∈ {PDF, DOCX, HTML, XML, TXT, MD}; unsupported → terminate with message.
+- **FR-1.2a** A **password-protected (encrypted) PDF** SHALL be detected at intake (pypdfium2 `FPDF_ERR_PASSWORD`, with a message-text fallback) and terminate with a clear, actionable message ("password-protected PDF is not supported; remove the password and re-ingest") rather than a generic downstream parse error. Other open failures are left for the parse stage (FR-2.6).
 - **FR-1.3** Compute **SHA-256 of raw bytes** = canonical `Document` id.
 - **FR-1.4** Query Neo4j for an existing `Document` with that hash.
 - **FR-1.5** Duplicate → terminate with status **`DUPLICATE`**; **re-ingestion not supported** (remediation: ingest the updated source as a new file).
@@ -282,12 +296,14 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 ### 3.2 Stage 2 — Docling Parse
 - **FR-2.1** Parse **fully locally** (no network) via Docling.
 - **FR-2.2** Use **DocLayNet** (layout) + **TableFormer** (tables).
-- **FR-2.3** **OCR enabled** for scanned/image PDFs, using the **EasyOCR** engine (D6).
+- **FR-2.3** **OCR applied to scanned/image PDFs** (auto-detected by default, FR-2.3e), using the **EasyOCR** engine (D6).
   - **FR-2.3a** EasyOCR SHALL be installed via the `docling[easyocr]` extra (no system binaries).
   - **FR-2.3b** EasyOCR SHALL run on the **GPU (CUDA)** by default, reusing the shared CUDA PyTorch build; it MUST fall back to CPU if no CUDA device is available (consistent with FR-Q3.2a).
   - **FR-2.3c** EasyOCR model weights (detection + recognition, ~100 MB) are downloaded on first run and cached locally; subsequent runs require no re-download.
   - **FR-2.3d** The OCR engine SHALL be selected explicitly in Docling pipeline options (EasyOCR), not left to Docling's auto/default selection.
-  - **FR-2.3e** OCR SHALL be toggleable via `OCR_ENABLED` (default `true`; sets Docling `PdfPipelineOptions.do_ocr`). Born-digital PDFs (with a real text layer) do not require OCR, which is the heaviest, most memory-hungry parse stage; setting `OCR_ENABLED=false` is the primary mitigation for large text PDFs that exhaust memory during parse (Docling `std::bad_alloc`). Default `true` preserves correctness on scanned input.
+  - **FR-2.3e** OCR SHALL be controlled by the tri-state `OCR_ENABLED` (default **`auto`**; normalized to `auto` | `on`/`true` | `off`/`false`; resolves to Docling `PdfPipelineOptions.do_ocr`). `on` forces OCR for every file; `off` disables it (the primary mitigation for large born-digital PDFs that exhaust memory during parse, Docling `std::bad_alloc`); **`auto`** decides per file via FR-2.3f. The decision is made in the `parse` node per document — no per-file env tuning. Non-PDF inputs never OCR.
+  - **FR-2.3f** In `auto` mode each PDF SHALL be classified from its **own text layer** by a shared classifier (`rag/ingestion/pdf_kind.py`), and OCR enabled only for `scanned`/`mixed` results. The classifier samples up to 1000 pages spread across the document and, for pages with no real text layer, measures the largest image's page coverage; a text-less page counts as **scanned** only when an image covers ≥ 80% of it (a full-page scan), so blank pages and partial figures do NOT trigger OCR. The digital/scanned/mixed label is a ratio over *text-vs-scanned* pages. On any probe failure it defaults to `digital` (the fast path) — a wrong guess yields too few chunks (visible, re-ingestable), versus a needless ~30-min OCR run. The same classifier backs the standalone `detect_pdf_kind.py` CLI.
+  - **FR-2.3g** OCR languages SHALL be configurable via `OCR_LANGUAGES` (EasyOCR codes, comma/space-separated; default `fr,de,es,en` = EasyOCR's built-in Latin set), passed to `EasyOcrOptions(lang=…)`. This enables non-Latin scans (e.g. `ch_sim,en`, `ja,en`, `ar,en`). The set MUST be script-compatible (English combines with anything; mixing incompatible scripts raises at model load) — this constraint is documented, not validated in code.
 - **FR-2.4** Return a `DoclingDocument` tree with typed elements: headings, paragraphs, tables, lists, warnings. **The tree is handed from `parse` to `chunk` via a process-local handoff, NOT through the checkpointed state (v2.12):** it is heavy and not msgpack-serializable, so persisting it crashes the Postgres checkpointer (`TypeError: Type is not msgpack serializable: DoclingDocument`). `parse`→`chunk` always run back-to-back in one process (the only interrupt is human_review, after chunk), so the handoff is safe.
 - **FR-2.5** Write raw bytes to a temp file for parsing; **delete temp file immediately after parse** (success or failure).
 - **FR-2.6** Parse failure (corrupt, unsupported encoding, zero content) → **parse-error terminal**, logging the Docling error.
@@ -334,20 +350,20 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 - **FR-6.6** Track `tokens_used` + `estimated_cost_usd`; store in state.
 - **FR-6.7** Attach embeddings to chunks.
 
-### 3.7 Stage 6 — Neo4j Write (Atomic)
-- **FR-7.1** Entire document in a **single transaction (all-or-nothing)**.
+### 3.7 Stage 6 — Neo4j Write (Atomic via batched write + compensation)
+- **FR-7.1** Entire document written **atomically (all-or-nothing)** from the caller's view. A single transaction over *all* chunks can grow large enough to fail the Neo4j store-apply on very large books (observed: a ~243k-command transaction wedged the database), so the write is split into bounded transactions — the `Document` node + iiRDS edges first, then chunks in batches of **`NEO4J_WRITE_BATCH_CHUNKS` (default 250)**, one transaction each. Atomicity is preserved by **compensation** (FR-7.8), not by a single transaction.
 - **FR-7.2** Create `Document {id=SHA-256, title, file_path, ingested_at, chunk_count, language}`.
 - **FR-7.3** iiRDS nodes (`Product, Component, LifecyclePhase, InformationType`) via **`MERGE`** (cross-doc dedup).
 - **FR-7.4** `Chunk {id, text, content_type, section_path, position, token_count, embedding[1536]}`.
 - **FR-7.5** Relationships: `RELATES_TO_PRODUCT, RELATES_TO_COMPONENT, HAS_LIFECYCLE_PHASE, HAS_INFORMATION_TYPE, HAS_CHUNK`.
 - **FR-7.6** Full-text (Lucene/BM25) index updated automatically on chunk text.
 - **FR-7.7** Vector index populated with 1536-dim embeddings (**cosine**).
-- **FR-7.8** Write failure → **full rollback** (no partial doc) → write-error terminal; safe to retry.
+- **FR-7.8** Write failure → **compensating delete** of the document + any chunk batches already committed (no partial doc) → write-error terminal; safe to retry. The cleanup is itself batched (`CALL { … } IN TRANSACTIONS`) so it cannot become an oversized transaction. If the compensating delete *also* fails (e.g. DB down), it is logged and a re-ingest reports the document as a **DUPLICATE** until it is cleaned up manually.
 - **FR-7.9** Commit → store `neo4j_doc_id, neo4j_chunk_ids[]`.
 - **FR-7.10** Required constraints/indexes (unique `Document.id`, vector index, full-text index) created idempotently if absent — performed canonically by the bootstrap (FR-S0.5), and re-checked at write time as a safety net.
 
 ### 3.8 Stage 7 — Receipt
-- **FR-8.1** Dual write: **(a)** append JSON to `ingestion_log.json` (`doc_hash, file_name, doc_title, ingested_at, chunk_count, total_tokens, embedding_cost_usd, stage_timings_ms, pipeline_status, low_confidence_flag`); **(b)** create `(:IngestionRecord)-[:INGESTION_OF]->(:Document)`.
+- **FR-8.1** Dual write: **(a)** write a **per-run** JSON file `ingestion_logs/ingestion_log_<UTCstamp>_<thread8>_<source-stem>.json` containing one record (`doc_hash, file_name, doc_title, ingested_at, chunk_count, total_tokens, embedding_cost_usd, stage_timings_ms, pipeline_status, low_confidence_flag`); **(b)** create `(:IngestionRecord)-[:INGESTION_OF]->(:Document)`. Each run produces its own file (no shared/appended log), so runs never overwrite each other.
 - **FR-8.2** If either receipt write fails → **warning only**, still exit success (document already durable).
 
 ### 3.9 Completion
@@ -546,7 +562,7 @@ flowchart TD
 - **NFR-PERF-6** The reranker SHALL process the Top-50 candidate set within one batch where memory permits.
 
 ### 5.2 Reliability & Data Integrity (NFR-REL)
-- **NFR-REL-1** No partial state: ingestion terminal failures leave zero partial graph data (atomic write, FR-7.1/7.8).
+- **NFR-REL-1** No partial state: ingestion terminal failures leave zero partial graph data (atomic write via bounded batches + compensating delete, FR-7.1/7.8).
 - **NFR-REL-2** Idempotent re-run on pre-commit ingestion failure (no manual cleanup).
 - **NFR-REL-3** Exactly-once per hash via SHA-256 dedup.
 - **NFR-REL-4** Cross-document iiRDS dedup via `MERGE`.
@@ -569,7 +585,7 @@ flowchart TD
 - **NFR-OBS-1** Structured logging records stage entry/exit, status, and errors with `thread_id` (implemented per **§5.8 NFR-LOG**).
 - **NFR-OBS-2** Per-stage timings (`stage_timings_ms`) captured for both pipelines.
 - **NFR-OBS-3** Token/cost tracking per ingestion run; query-side OpenAI token usage SHOULD also be tracked per query.
-- **NFR-OBS-4** `ingestion_log.json` provides an append-only ingestion audit trail.
+- **NFR-OBS-4** The `ingestion_logs/` directory provides the ingestion audit trail — one self-contained JSON file per run (FR-8.1a).
 - **NFR-OBS-5** Full run state inspectable post-hoc from the Postgres checkpointer via `thread_id` (both pipelines).
 - **NFR-OBS-6** Query answers SHALL log which retrievers contributed and the final chunk ids used (traceability/debuggability).
 
@@ -595,12 +611,12 @@ flowchart TD
 ### 5.8 Logging (NFR-LOG)
 - **NFR-LOG-1** All components SHALL log via the Python `logging` module through a **single shared configuration** (NFR-MAINT-7); `print()` SHALL NOT be used for diagnostics.
 - **NFR-LOG-2** Log records SHALL be **structured JSON** by default (`LOG_FORMAT=json`), with a human-readable `text` mode for local debugging. Each record SHALL include at least: timestamp, level, logger name, message, `thread_id`, pipeline (`ingest`/`query`), and stage.
-- **NFR-LOG-3** Logs SHALL be emitted to **both the console and a rotating file** under `LOG_DIR` (default `./logs`, git-ignored). File rotation SHALL be size-based with retained backups (e.g. 10 MB × 5) to bound disk usage.
+- **NFR-LOG-3** Logs SHALL be emitted to **both the console and a per-run file** under `LOG_DIR` (default `./logs`, git-ignored). Each process invocation writes its own file named `<pipeline>_<UTCstamp>_<pid>.log` so runs never share a file; within a single run, file rotation SHALL still be size-based with retained backups (e.g. 10 MB × 5) to bound disk usage.
 - **NFR-LOG-4** The application log level SHALL be configurable via `LOG_LEVEL` (default `INFO`); `DEBUG` enables verbose tracing.
 - **NFR-LOG-5** Third-party loggers (`httpx`, `openai`, `neo4j`, `psycopg`, `transformers`, `docling`, `urllib3`) SHALL default to `WARNING` to suppress noise, independent of the app `LOG_LEVEL`.
 - **NFR-LOG-6** Logs SHALL NOT contain secrets (API keys, DB passwords, connection-string credentials) — reinforcing NFR-SEC-7 — and SHALL NOT dump full payloads (document text, chunk text, embedding vectors); such content SHALL be omitted, truncated, or summarized (lengths/counts/ids).
 - **NFR-LOG-7** Every stage transition (entry/exit + status) and every error/retry SHALL be logged with its `thread_id` for correlation (consolidates NFR-OBS-1); exceptions SHALL be logged with stack traces at `ERROR`.
-- **NFR-LOG-8** The on-disk application log (NFR-LOG-3) is operational/diagnostic and is **distinct** from the durable ingestion audit trail `ingestion_log.json` (FR-8.1 / NFR-OBS-4) and the Neo4j `IngestionRecord`; the three serve different purposes and coexist.
+- **NFR-LOG-8** The on-disk application log (NFR-LOG-3) is operational/diagnostic and is **distinct** from the durable ingestion audit trail (per-run files under `ingestion_logs/`, FR-8.1 / NFR-OBS-4) and the Neo4j `IngestionRecord`; the three serve different purposes and coexist.
 
 ---
 
@@ -623,7 +639,7 @@ Assumptions:
 - **A1** Docker Desktop installed and running (hosts the Neo4j container). **Postgres is installed natively** on the laptop (D15) and its service is running.
 - **A2** NVIDIA GPU driver + a CUDA-build of PyTorch are installed (per §2.3). Disk available for Docling + BGE + **EasyOCR** weights (first-run downloads: Docling/BGE several hundred MB, EasyOCR ~100 MB).
 - **A3** OpenAI account has quota for `gpt-4o-mini` + `text-embedding-3-small`.
-- **A4** Source docs are supported formats (FR-1.2), not encrypted/password-protected.
+- **A4** Source docs are supported formats (FR-1.2). Encrypted/password-protected PDFs are **detected and rejected** at intake with a clear message (FR-1.2a), not silently mis-parsed.
 - **A5** Embedding model+dimension (1536) are fixed for the index lifetime; changing them requires a full re-index (and the query side must change in lockstep).
 - **A6** The graph already contains ingested documents before the query pipeline is exercised (query depends on ingestion output).
 
@@ -648,12 +664,12 @@ Assumptions:
 ## 8. Acceptance Criteria
 
 ### 8.1 Ingestion
-- **AC-1** Ingesting a valid PDF creates `Document` + `Chunk`s + iiRDS nodes + `IngestionRecord`, an `ingestion_log.json` entry, and a success summary (cost + timing).
+- **AC-1** Ingesting a valid PDF creates `Document` + `Chunk`s + iiRDS nodes + `IngestionRecord`, a per-run `ingestion_logs/…json` file, and a success summary (cost + timing).
 - **AC-2** Re-ingesting the same file → clean `DUPLICATE` termination, no new graph data, **no** OpenAI calls.
 - **AC-3** A corrupted file → parse-error termination, clear message, no graph writes.
 - **AC-4** Simulated embedding failure → no Neo4j write; file re-ingestable.
 - **AC-5** Low-confidence tagging suspends at human review; `python review_tags.py <thread_id>` resumes and completes with corrected tags.
-- **AC-6** Simulated Neo4j write failure → zero partial data (full rollback), safely retryable.
+- **AC-6** Simulated Neo4j write failure → zero partial data (compensating delete of the partial doc + committed chunk batches), safely retryable.
 - **AC-7** Tables/lists/warnings each appear as single unfragmented chunks; long paragraphs split at ~512 tokens with 50-token overlap.
 - **AC-7a** A scanned/image-only PDF is parsed with text recognized via **EasyOCR running on the GPU** (no OpenAI/cloud OCR call); `RERANKER_DEVICE`/OCR CPU fallback still produces text when CUDA is forced off.
 - **AC-8** Neo4j container restart preserves all ingested data (volume persistence).
@@ -675,7 +691,7 @@ Assumptions:
 ### 8.3 Stack
 - **AC-16** The full stack installs and runs on **Python 3.13.14** with §2.3 versions; the CUDA torch build is installed and the RTX 4090 is used by default (CPU fallback works); `pip-audit` reports no known high/critical vulnerabilities.
 - **AC-17** The bootstrap command (§2.4) on a clean machine: asserts CUDA + logs the GPU name, downloads/caches all three model sets, smoke-tests each on the GPU, creates the Neo4j constraints/indexes **and the Postgres checkpointer tables**, and prints "environment ready"; on a CPU-only torch install it instead fails fast with an actionable message. After a successful bootstrap, a subsequent ingest/query performs **no** model downloads.
-- **AC-18** Logs are emitted as structured JSON to **console + a rotating file** under `LOG_DIR`, each record carrying `thread_id`/pipeline/stage; `LOG_LEVEL=DEBUG` increases app verbosity while third-party loggers stay at `WARNING`; and **no secrets or full document/chunk/embedding payloads** appear in any log line (NFR-LOG / NFR-SEC-7).
+- **AC-18** Logs are emitted as structured JSON to **console + a per-run file** under `LOG_DIR` (`<pipeline>_<UTCstamp>_<pid>.log`), each record carrying `thread_id`/pipeline/stage; `LOG_LEVEL=DEBUG` increases app verbosity while third-party loggers stay at `WARNING`; and **no secrets or full document/chunk/embedding payloads** appear in any log line (NFR-LOG / NFR-SEC-7).
 
 ---
 

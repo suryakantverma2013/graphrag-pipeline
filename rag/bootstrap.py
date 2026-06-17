@@ -56,7 +56,7 @@ def _warm_models(config: AppConfig) -> None:
 def run_bootstrap(config: AppConfig | None = None) -> int:
     """Execute the full bootstrap; return a process exit code (FR-S0.6)."""
     config = config or get_config()
-    setup_logging(config)
+    setup_logging(config, "bootstrap")
 
     failures: list[str] = []
 

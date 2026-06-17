@@ -16,7 +16,7 @@ from .logging_config import set_context, setup_logging
 def init_runtime(pipeline: str) -> AppConfig:
     """Load config, configure logging, set the pipeline log context."""
     config = get_config()
-    setup_logging(config)
+    setup_logging(config, pipeline)
     set_context(pipeline=pipeline)
     return config
 
