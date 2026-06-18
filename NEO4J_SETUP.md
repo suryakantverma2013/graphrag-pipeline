@@ -2,7 +2,7 @@
 # Neo4j (Docker) — Installation & Configuration Guide
 
 **Scope:** Install and configure the Neo4j graph database used by this RAG pipeline as a local Docker container on **Windows 11**. Neo4j stores the knowledge graph (`Document`/`Chunk`/iiRDS nodes), the **vector index** (1536-dim, cosine) and the **full-text (Lucene/BM25) index**.
-**Companion files:** `docker-compose.yml` (defines the service), `.env` (credentials), `REQUIREMENTS.md` (§2.1 topology, §2.3 versions, FR-7.x graph writes, FR-S0.5 index bootstrap).
+**Companion files:** `docker-compose.yml` (defines the service), `.env` (credentials), `REQUIREMENTS.md` (§2.1 topology, §2.3 versions, FR-7.x graph writes, FR-S0.5 index bootstrap). For the **graph schema** itself — node labels, properties, relationships, and how a document is laid out once stored — see [`NEO4J_GRAPH_SCHEMA.md`](./NEO4J_GRAPH_SCHEMA.md).
 
 > **Edition:** This guide uses **Neo4j Community Edition**, which is sufficient for the single-user scope (decision D3). Community is single-database (the default `neo4j` DB) and has no role-based auth or online backup — all acceptable here. Enterprise is **not** required.
 

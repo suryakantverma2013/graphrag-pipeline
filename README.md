@@ -164,6 +164,7 @@ python query.py "What is the rated flow of the pump?"
 | [**REQUIREMENTS.md**](./REQUIREMENTS.md) | The functional/non-functional contract: decisions D1–D17, every FR/NFR, acceptance criteria, risks, the rationale for every local-vs-cloud placement. |
 | [**BENCHMARK.md**](./BENCHMARK.md) | Hybrid-vs-simple retrieval **evaluation harness** — methodology, what's compared, how to run it, and honest limits. Operator runbook in [User Manual §17](./USER_MANUAL.md#17-evaluation-hybrid-vs-simple-benchmark). |
 | [NEO4J_SETUP.md](./NEO4J_SETUP.md) | Neo4j (Docker) provisioning. |
+| [**NEO4J_GRAPH_SCHEMA.md**](./NEO4J_GRAPH_SCHEMA.md) | How ingested documents are stored in Neo4j: every node label/property, relationship type, write order + atomicity, indexes/constraints, and ready-to-paste Cypher — with diagrams. |
 | [POSTGRES_SETUP.md](./POSTGRES_SETUP.md) | Postgres (native on-prem) provisioning. |
 
 ## Scope & honest caveats

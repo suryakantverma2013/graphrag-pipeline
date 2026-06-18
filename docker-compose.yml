@@ -29,8 +29,8 @@ services:
     environment:
       NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
     volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
+      - F:/UdemyCourses_Study_Material/Ne04jGraphDatabaseSample/Neo4j_Volumes/neo4j_data:/data
+      - F:/UdemyCourses_Study_Material/Ne04jGraphDatabaseSample/Neo4j_Volumes/neo4j_logs:/logs
     # Connectivity + index creation are verified/performed by the app
     # bootstrap (REQUIREMENTS.md FR-S0.5), so no DB-auth healthcheck here.
 
