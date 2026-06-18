@@ -22,6 +22,10 @@ logs/
 *.log
 # Regenerated each run by calibrate_confidence.py (keep calibration_queries.txt, not this)
 calibration_results.csv
+# Regenerated each run by benchmark_compare.py (hybrid-vs-simple benchmark outputs)
+benchmark_results.csv
+benchmark_results.json
+benchmark_report.md
 
 # ----- Standalone HTML design diagrams (don't render on GitHub; mermaid in -----
 # ----- README.md / USER_MANUAL.md is the published version) -------------------

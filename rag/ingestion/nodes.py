@@ -326,8 +326,15 @@ def parse(state: IngestionState) -> dict:
             pdf_kind = kind_result.kind
             logger.info("pdf kind=%s — %s", pdf_kind, kind_result.reason)
         do_ocr = config.resolve_ocr(pdf_kind) if is_pdf else False
+        # OCR is heavy per page, so it uses the smaller slice; and the scanned-page
+        # bitmap is the only text source, so it also renders at the sharper OCR DPI
+        # (pdf_render_dpi_ocr) for legibility. Born-digital parsing keeps the 72-dpi
+        # backdrop. Both fold into an effective per-document config.
         eff_batch = config.pdf_parse_batch_pages_ocr if do_ocr else config.pdf_parse_batch_pages
-        eff_config = config.model_copy(update={"pdf_parse_batch_pages": eff_batch})
+        eff_updates: dict[str, Any] = {"pdf_parse_batch_pages": eff_batch}
+        if do_ocr:
+            eff_updates["pdf_render_dpi"] = config.pdf_render_dpi_ocr
+        eff_config = config.model_copy(update=eff_updates)
         # Plan slices AFTER writing bytes (page count is read from the temp file).
         page_ranges = _plan_page_ranges(temp_path, eff_config, is_pdf)
         n_slices = len(page_ranges)

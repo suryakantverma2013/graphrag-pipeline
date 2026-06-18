@@ -153,6 +153,8 @@ python query.py "What is the rated flow of the pump?"
 | `python query.py "<question>"` | Ask one question (cited answer) | `0` ok · `1` error · `4` suspended |
 | `python resume_query.py <thread_id>` | Resume query at clarification/escalation | `0`/`1`/`4` |
 | `python calibrate_confidence.py [queries.txt]` | Offline harness to tune the escalate threshold | `0` ok |
+| `python baseline_ingest.py [--reset] <path…>` | Build the simple embedding-only baseline store for the benchmark | `0` ok · `1` all failed · `2` bad args |
+| `python benchmark_compare.py [queries.txt]` | Compare hybrid vs. simple retrieval; writes the evaluation summary | `0` ok · `1`/`2` |
 
 ## Documentation
 
@@ -160,6 +162,7 @@ python query.py "What is the rated flow of the pump?"
 |---|---|
 | [**USER_MANUAL.md**](./USER_MANUAL.md) | Install, config reference, ingestion/query flows, CLI reference, human-in-the-loop ops, observability, cost, troubleshooting, **how to extend**, calibration, FAQ. |
 | [**REQUIREMENTS.md**](./REQUIREMENTS.md) | The functional/non-functional contract: decisions D1–D17, every FR/NFR, acceptance criteria, risks, the rationale for every local-vs-cloud placement. |
+| [**BENCHMARK.md**](./BENCHMARK.md) | Hybrid-vs-simple retrieval **evaluation harness** — methodology, what's compared, how to run it, and honest limits. Operator runbook in [User Manual §17](./USER_MANUAL.md#17-evaluation-hybrid-vs-simple-benchmark). |
 | [NEO4J_SETUP.md](./NEO4J_SETUP.md) | Neo4j (Docker) provisioning. |
 | [POSTGRES_SETUP.md](./POSTGRES_SETUP.md) | Postgres (native on-prem) provisioning. |
 

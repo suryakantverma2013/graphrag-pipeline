@@ -88,8 +88,17 @@ class AppConfig(BaseSettings):
     pdf_max_pages: int = 0
     # Page rasterization resolution. Docling's images_scale = dpi / 72; lower DPI
     # = smaller page bitmaps = less memory during preprocess. 72 = Docling default
-    # (unchanged behavior); drop to e.g. 48 to relieve memory pressure.
+    # (unchanged behavior); drop to e.g. 48 to relieve memory pressure. This is the
+    # BORN-DIGITAL DPI: the page bitmap is only a layout backdrop, so 72 is plenty.
     pdf_render_dpi: int = 72
+    # Page rasterization resolution used WHEN OCR IS ACTIVE. On a scanned page the
+    # bitmap is the only text source, so EasyOCR reads it directly — 72 dpi makes
+    # small glyphs (subscripts, math notation, diacritics) marginal. Rendering
+    # sharper improves OCR accuracy at the cost of memory/time (it scales ~dpi^2),
+    # so the OCR path is also batched smaller (pdf_parse_batch_pages_ocr). The
+    # parse node folds this into pdf_render_dpi only when the OCR decision is on
+    # (FR-2.3e); the born-digital fast path keeps pdf_render_dpi=72 untouched.
+    pdf_render_dpi_ocr: int = 150
     # Page-range batch size for parsing (PDF only). Docling accumulates memory
     # within a single convert() call and OOMs (std::bad_alloc) on very large PDFs
     # (~127 pages on a 24 GB box, independent of DPI/OCR). When > 0, a PDF is
@@ -98,10 +107,13 @@ class AppConfig(BaseSettings):
     # (legacy). 100 leaves headroom under the observed ceiling.
     pdf_parse_batch_pages: int = 100
     # Slice size used when OCR is active. OCR (rasterize + two neural models per
-    # page) is far heavier per page than text extraction, so scanned/mixed PDFs
-    # use a smaller slice. The parse node picks this vs pdf_parse_batch_pages from
-    # the resolved OCR decision (FR-2.8c / FR-2.3e).
-    pdf_parse_batch_pages_ocr: int = 25
+    # page) is far heavier per page than text extraction, AND the OCR path renders
+    # at the sharper pdf_render_dpi_ocr (150 → ~4.3x the pixels of 72), so peak
+    # memory per slice is much higher — hence a much smaller slice (12, vs 100
+    # born-digital) to stay clear of Docling's std::bad_alloc ceiling. The parse
+    # node picks this vs pdf_parse_batch_pages from the resolved OCR decision
+    # (FR-2.8c / FR-2.3e). If a higher pdf_render_dpi_ocr OOMs, lower this further.
+    pdf_parse_batch_pages_ocr: int = 12
 
     # --- Tunables (defaults from the diagrams / decisions) ---
     chunk_max_tokens: int = 512             # FR-3.4

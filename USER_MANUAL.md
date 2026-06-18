@@ -36,8 +36,13 @@
 14. [Troubleshooting](#14-troubleshooting)
 15. [Extending the system](#15-extending-the-system)
 16. [Calibrating confidence thresholds](#16-calibrating-confidence-thresholds)
-17. [Glossary](#17-glossary)
-18. [FAQ](#18-faq)
+17. [Evaluation: hybrid vs. simple benchmark](#17-evaluation-hybrid-vs-simple-benchmark)
+    - [17.1 Step 1 — ingest the baseline corpus](#171-step-1--ingest-the-baseline-corpus)
+    - [17.2 Step 2 — run the comparison](#172-step-2--run-the-comparison)
+    - [17.3 Step 3 — read the evaluation summary](#173-step-3--read-the-evaluation-summary)
+    - [17.4 What it measures — and what it does not](#174-what-it-measures--and-what-it-does-not)
+18. [Glossary](#18-glossary)
+19. [FAQ](#19-faq)
 
 ---
 
@@ -286,11 +291,12 @@ All settings come from environment variables (loaded from `.env`). A single type
 | `OCR_ENABLED` | `auto` | OCR control. **`auto`** (default) classifies each PDF from its own text layer and turns OCR on only for scanned/mixed files — no per-file tuning. `on`/`true` forces OCR everywhere; `off`/`false` disables it (fast path for known born‑digital PDFs; biggest lever against `std::bad_alloc`). |
 | `OCR_LANGUAGES` | `fr,de,es,en` | EasyOCR language codes (comma/space‑separated) used when OCR runs. Default is EasyOCR's Latin set. For non‑Latin scans set e.g. `ch_sim,en`, `ja,en`, `ar,en`, `ru,en`, `hi,en`. Must be **script‑compatible** (English mixes with anything; you can't mix e.g. Chinese + Arabic) or EasyOCR errors at model load. |
 | `PDF_MAX_PAGES` | `0` | Parse only the first N pages of a PDF (`0` = all). Bounds memory/time on very large documents. |
-| `PDF_RENDER_DPI` | `72` | Page rasterization resolution (Docling `images_scale = dpi/72`). Lower (e.g. `48`) = smaller page bitmaps = less memory. `72` is the Docling default. **Note:** does *not* fix `std::bad_alloc` on very large PDFs — that ceiling is page-count-driven, not DPI-driven (use `PDF_PARSE_BATCH_PAGES`). |
+| `PDF_RENDER_DPI` | `72` | **Born‑digital** page rasterization resolution (Docling `images_scale = dpi/72`). Here the bitmap is only a layout backdrop, so `72` (Docling's default) is fine; lower (e.g. `48`) = less memory. **Note:** does *not* fix `std::bad_alloc` on very large PDFs — that ceiling is page-count-driven, not DPI-driven (use `PDF_PARSE_BATCH_PAGES`). |
+| `PDF_RENDER_DPI_OCR` | `150` | Render DPI used **when OCR is active** (scanned/mixed). The scanned page bitmap is the *only* text source EasyOCR reads, so a higher DPI sharpens small glyphs (subscripts, math, diacritics) and improves recognition. Costs memory/time (~dpi²); applied automatically only when the OCR decision is on. If a high DPI runs out of memory, lower `PDF_PARSE_BATCH_PAGES_OCR`. |
 | `PDF_PARSE_BATCH_PAGES` | `100` | Slice size for **born‑digital** PDFs (no OCR). Parsing in N-page slices frees memory between slices so Docling never accumulates past its `std::bad_alloc` ceiling — captures the **whole** document. `0` = single-shot convert (legacy). |
-| `PDF_PARSE_BATCH_PAGES_OCR` | `25` | Slice size used when OCR is active (scanned/mixed). OCR is far heavier per page, so a smaller slice is used. Chosen automatically based on the OCR decision. |
+| `PDF_PARSE_BATCH_PAGES_OCR` | `12` | Slice size used when OCR is active (scanned/mixed). OCR is far heavier per page **and** renders at the sharper `PDF_RENDER_DPI_OCR`, so a much smaller slice keeps per-slice memory bounded. Chosen automatically based on the OCR decision. |
 
-> **OCR is now automatic.** With `OCR_ENABLED=auto` (the default) you no longer decide born‑digital vs scanned per file — the `parse` node classifies each PDF from its own text layer and turns OCR on only when it's actually scanned (or mixed). It also picks the slice size automatically: `PDF_PARSE_BATCH_PAGES` (100) for born‑digital, `PDF_PARSE_BATCH_PAGES_OCR` (25) when OCR runs. The run logs the decision, e.g. `pdf kind=digital — …` / `pdf kind=scanned — … needs OCR`.
+> **OCR is now automatic.** With `OCR_ENABLED=auto` (the default) you no longer decide born‑digital vs scanned per file — the `parse` node classifies each PDF from its own text layer and turns OCR on only when it's actually scanned (or mixed). It also picks the slice size **and the render DPI** automatically: `PDF_PARSE_BATCH_PAGES` (100) + `PDF_RENDER_DPI` (72) for born‑digital, `PDF_PARSE_BATCH_PAGES_OCR` (12) + the sharper `PDF_RENDER_DPI_OCR` (150) when OCR runs. The run logs the decision and the DPI, e.g. `pdf kind=scanned — … needs OCR` then `Docling converter: ocr=True … render_dpi=150`.
 >
 > **How the classifier decides** (`rag/ingestion/pdf_kind.py`): it samples up to 1000 pages across the document; a page with a real text layer counts as *text*, a text‑less page whose image covers ≥80% of it counts as *scanned*, and blank/partial‑figure pages are ignored. `digital` = ~all text, `scanned` = ~all full‑page images, `mixed` = a real blend (OCR'd so the scanned pages aren't lost). This is why a born‑digital book full of diagrams is **not** mis‑flagged as scanned.
 >
@@ -314,7 +320,7 @@ All settings come from environment variables (loaded from `.env`). A single type
 | `NEO4J_WRITE_BATCH_CHUNKS` | `250` | Chunks per Neo4j write transaction. Bounds transaction size so a very large book can't overflow a single transaction (which wedged the store). A failed write is compensated by deleting the partial document. Lower it if writes still strain on huge chunks. |
 | `TAG_CONFIDENCE_THRESHOLD` | `0.5` | Below → suspend for human tag review. |
 | `REFINE_CONFIDENCE_THRESHOLD` | `0.6` | Below → request clarification. |
-| `ESCALATE_CONFIDENCE_THRESHOLD` | `0.38` | Below → escalate retrieval for expert review. Calibrated against the real corpus (see §17). |
+| `ESCALATE_CONFIDENCE_THRESHOLD` | `0.38` | Below → escalate retrieval for expert review. Calibrated against the real corpus (see [§16](#16-calibrating-confidence-thresholds)). |
 | `PER_RETRIEVER_K` | `25` | Hits per retriever. |
 | `RETRIEVE_TOP_K` | `50` | Merged/deduped candidate cap. |
 | `RERANK_TOP_K` | `10` | Re‑ranked chunks kept for synthesis. |
@@ -460,6 +466,8 @@ flowchart TD
 | `python query.py "<question>"` | Ask one question; print a cited answer. | `0` ok · `1` error · `4` suspended (clarification/escalation) |
 | `python resume_query.py <thread_id>` | Resume a query suspended at clarification or escalation. | `0` ok · `1` error · `4` suspended |
 | `python calibrate_confidence.py [queries.txt]` | Offline harness to tune the escalate threshold (see [§16](#16-calibrating-confidence-thresholds)). | `0` ok |
+| `python baseline_ingest.py [--reset] <path…>` | Build the simple embedding-only baseline store for the benchmark (see [§17](#17-evaluation-hybrid-vs-simple-benchmark)). | `0` ok · `1` all failed · `2` bad args |
+| `python benchmark_compare.py [queries.txt] [--k N] [--limit N]` | Compare hybrid vs. simple retrieval and write the evaluation summary (see [§17](#17-evaluation-hybrid-vs-simple-benchmark)). | `0` ok · `1` no comparisons · `2` bad args / empty store |
 
 **Exit code semantics (scriptable):** `0` success · `1` terminal error (intake/parse/embed/write, or query produced no answer) · `3` duplicate document · `4` suspended for human input (resume with the matching `*_tags`/`resume_query` command). Each entry point prints the exact resume command when it suspends.
 
@@ -633,6 +641,7 @@ Stated honestly, per the project's standards.
 | Ingest exits `1` with `INTAKE_ERROR` | Path missing/unreadable or unsupported format | Use a supported format (PDF, DOCX, HTML, XML, TXT, MD) and a readable path. |
 | Ingest exits `1` with `INTAKE_ERROR: password-protected (encrypted) PDF is not supported` | The PDF requires a password to open | Remove the password — re‑save or print to an unprotected PDF (e.g. open in a viewer and "Print → Save as PDF") — then re‑ingest. Password‑protected PDFs can't be parsed. |
 | Scanned PDF OCRs to **garbage / wrong characters** | OCR language set doesn't match the document's script (default is Latin `fr,de,es,en`) | Set `OCR_LANGUAGES` to the right EasyOCR codes (e.g. `ch_sim,en`, `ja,en`, `ar,en`, `ru,en`) and re‑ingest. Keep the set script‑compatible. See [§6](#6-configuration-reference). |
+| Scanned PDF OCRs **mostly right but small text is fuzzy** — dropped subscripts, mangled math/diacritics | The OCR render resolution is too low for fine glyphs | Raise `PDF_RENDER_DPI_OCR` (default `150`; try `200`+) and re‑ingest. It only affects OCR runs. If the higher DPI OOMs (`std::bad_alloc`), lower `PDF_PARSE_BATCH_PAGES_OCR` below its `12` default (e.g. `8` or less) to keep per-slice memory bounded. See [§6](#6-configuration-reference). |
 | Ingest log shows `std::bad_alloc` repeating per page; summary says `⚠ INCOMPLETE: N pages failed` | Docling exhausts memory mid-parse on a very large PDF (accumulates within one `convert()` call) | Keep `PDF_PARSE_BATCH_PAGES` at its default `100` (or lower it) so the PDF is parsed in slices — this captures the whole book. Lowering `PDF_RENDER_DPI` will *not* help here. Re-ingest after changing. See [§6](#6-configuration-reference). |
 | Big PDF ingests but `chunk` reports only **1–2 chunks** / `total_tokens` tiny; run **suspends with tag confidence `0.00`** | A **scanned/image PDF** was parsed without OCR — no text layer to extract. With `OCR_ENABLED=auto` this should self-correct; it indicates a misclassification (or `OCR_ENABLED=off`). | Abandon the review (`Ctrl+C` — nothing is written yet). Check the logged `pdf kind=…`; if it misread a scanned book as digital, force it: re-ingest with **`OCR_ENABLED=on`**. Confirm with `python detect_pdf_kind.py --json <file>`. See [§6](#6-configuration-reference). |
 | Ingest exits `1` with `EMBED_ERROR` | OpenAI outage/quota after 3 retries | No graph write occurred; fix the OpenAI issue and re‑submit the file. |
@@ -713,7 +722,83 @@ Workflow: ingest a representative set of your real documents → assemble labele
 
 ---
 
-## 17. Glossary
+## 17. Evaluation: hybrid vs. simple benchmark
+
+This is the **answer‑quality / retrieval evaluation harness**: it measures how much the full **hybrid** pipeline (Neo4j BM25 + vector + graph → weighted‑RRF → BGE re‑rank → the whole query‑reasoning chain) actually improves over a deliberately **simple** embedding‑only baseline (plain PDF text → chunk → embed → **pgvector** cosine top‑k). It exists to answer one concrete question on *your* corpus: *"how much does hybrid search improve over plain embedding search?"* — with numbers from a run rather than a guess.
+
+The chunker and embedder are **deliberately shared** between the two paths (same 512/50 sentence‑packing, same `text-embedding-3-small`), so the only things that differ are the **parse** step and the **retrieval** step — which is exactly what the benchmark isolates.
+
+> `BENCHMARK.md` is the standalone methodology document (the comparison table, file map, and full caveats). This section is the **operator runbook** — the three commands and how to read the output. Read `BENCHMARK.md` before quoting any number from a run.
+
+**Prerequisites:**
+
+- The **hybrid corpus is already ingested into Neo4j** (the normal `ingest_document.py` path) — the hybrid side searches the live graph.
+- **Postgres with the `pgvector` extension available** (verified: pgvector 0.8.1 on PostgreSQL 18). The harness runs `CREATE EXTENSION IF NOT EXISTS vector` itself. **No new Python dependency** — it reuses the `psycopg` already pulled in by the LangGraph checkpointer. The baseline store is a separate table (`baseline_chunks`) in the *same* Postgres named by `CHECKPOINT_DB_URI`.
+- An **OpenAI API key with quota** — both paths embed and synthesize, so a full run costs real (small) money. Re‑ranking stays local/free.
+
+### 17.1 Step 1 — ingest the baseline corpus
+
+Populate the simple store from the **same source PDFs that are in Neo4j**, so both stores cover the same corpus and the comparison is fair. `baseline_ingest.py` extracts text with pypdfium2 (**no OCR**), then chunks and embeds with the *same* code the hybrid pipeline uses.
+
+```powershell
+# --reset drops & recreates the baseline_chunks table first (start clean).
+python baseline_ingest.py --reset `
+    samples\Java-TheCompleteReference-11Edition.pdf `
+    samples\JavaPersistencewithHibernate.pdf
+
+# A directory works too (globs *.pdf; add --recursive to descend):
+python baseline_ingest.py samples\JavaBooks
+```
+
+- Each PDF is keyed by the **SHA‑256 of its bytes** — the *same* id the Neo4j `Document` uses — so the two stores align by document for overlap scoring, and re‑ingesting a file just replaces its rows (idempotent).
+- It prints per file: chunk count, token count, estimated embedding cost, and extract/embed timings, then a store total.
+- Exit `0` ok · `1` every file failed · `2` no PDFs found in the given paths.
+
+> **Corpus‑parity caveat.** Document overlap is only meaningful for PDFs that are in **both** stores. If a document is in the graph but its source PDF isn't on disk, it can't be mirrored into the baseline, and queries targeting it are flagged `baseline_corpus_miss` in the report (so a corpus gap isn't misread as a retrieval loss). In this project the 5 OpenText Documentum guides have **no source PDFs on disk**, so their queries can't be benchmarked — only the documents you can actually re‑ingest above are comparable.
+
+### 17.2 Step 2 — run the comparison
+
+```powershell
+# All queries, top-k = RERANK_TOP_K (10). Uses the SAME query-file format as the
+# calibration harness (`<label> | <query>`); the labels are ignored here.
+python benchmark_compare.py
+
+# Or a named file / a quick subset:
+python benchmark_compare.py calibration_queries.txt --limit 8 --k 10
+```
+
+For every query it runs **both** read paths back‑to‑back:
+
+- **HYBRID** — the real production query nodes, end to end through `synthesize_answer` (the clarification/escalation interrupts are skipped so *every* query is actually retrieved and answered).
+- **SIMPLE** — embed the raw query once, cosine top‑k from the pgvector baseline, then synthesize with the **same** system prompt and model.
+
+A usage meter wraps the shared OpenAI client, so the **same instrument** measures calls and (estimated) tokens on both sides. A live table streams per‑query: doc Jaccard, top‑1 match, hybrid/simple latency, and hybrid/simple estimated cost. Exit `0` ok · `1` no query produced a comparison · `2` bad args or the baseline store is empty (run Step 1 first).
+
+### 17.3 Step 3 — read the evaluation summary
+
+Each run regenerates **three files** in the repo root (all git‑ignored):
+
+| File | What it gives you |
+|---|---|
+| `benchmark_report.md` | **The human‑readable summary** — start here. An aggregate block (mean doc‑set Jaccard, top‑1 agreement rate, baseline‑corpus misses, mean hybrid‑vs‑simple latency + ratio, mean estimated cost/query + ratio, mean LLM calls/query) followed by a **per‑query side‑by‑side**: both retrieved document sets and **both synthesized answers**, with the embedded caveat. This is what makes "how much better is hybrid" legible. |
+| `benchmark_results.csv` | One row per query — the same metrics, for spreadsheets/plots. |
+| `benchmark_results.json` | Full structured results including both complete answers and document lists, for programmatic analysis. |
+
+The aggregate at the top of `benchmark_report.md` (and the terminal summary) is the "clear idea of quality across two approaches" you're after: it quantifies how often the two approaches retrieve the **same** documents (low overlap = hybrid is pulling in evidence plain cosine misses) and what hybrid's extra accuracy **costs** in latency, dollars, and LLM calls. The per‑query answer pairs let you judge response quality directly, query by query.
+
+### 17.4 What it measures — and what it does not
+
+Stated honestly, per the project's standards — **read this before quoting any number:**
+
+- **No labelled relevance set.** There is **no recall@k / nDCG** here. Answer quality is a **qualitative side‑by‑side**, not a score. Adding hand‑labelled qrels is the next step if you need an authoritative retrieval‑quality number.
+- **Cost is an estimate (±~10%).** Tokens are counted with `cl100k_base`; `gpt-4o-mini` bills on `o200k_base`, so the dollar figures are good for a *relative* comparison, not an invoice. Latency is exact wall‑clock. Verify the pricing constants in `benchmark_compare.py` against current OpenAI rates.
+- **Corpus parity matters.** Overlap aligns by source‑file hash, so it's only meaningful for PDFs in *both* stores (see the `baseline_corpus_miss` flag and the Documentum caveat in [§17.1](#171-step-1--ingest-the-baseline-corpus)).
+- **Two variables move at once** (parse *and* retrieval). This is an **end‑to‑end pipeline comparison by design**, not a single‑variable ablation. For a clean retrieval‑only number, re‑point the baseline at the *same chunk text the graph holds* instead of re‑parsing the PDF.
+- **Status:** the harness is built and its modules/infra are verified (imports, pgvector round‑trip, naive parse), but it has **not yet been run end‑to‑end** on a paid pass, so this manual documents the procedure without claiming result numbers. Run the three steps above on your corpus to produce them.
+
+---
+
+## 18. Glossary
 
 | Term | Meaning |
 |---|---|
@@ -728,7 +813,7 @@ Workflow: ingest a representative set of your real documents → assemble labele
 
 ---
 
-## 18. FAQ
+## 19. FAQ
 
 **Do I have to run the bootstrap?** Yes, once per environment. It's the required, documented path; lazy first‑run download is only a fallback and won't create indexes/tables.
 
