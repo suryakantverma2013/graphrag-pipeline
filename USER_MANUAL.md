@@ -786,11 +786,20 @@ Each run regenerates **three files** in the repo root (all git‑ignored):
 
 The aggregate at the top of `benchmark_report.md` (and the terminal summary) is the "clear idea of quality across two approaches" you're after: it quantifies how often the two approaches retrieve the **same** documents (low overlap = hybrid is pulling in evidence plain cosine misses) and what hybrid's extra accuracy **costs** in latency, dollars, and LLM calls. The per‑query answer pairs let you judge response quality directly, query by query.
 
+**Two overlap metrics — read them together:**
+
+| Metric | What it tells you |
+|---|---|
+| **Document‑set Jaccard** + top‑1 agreement | Do the two paths retrieve from the same *files*? Useful as a corpus‑parity sanity check, but it **saturates near 1.0 on a small corpus** — with only a couple of documents almost every hit maps to the same files, so it can't resolve a retrieval‑quality difference. |
+| **Content overlap** (5‑gram shingle **Jaccard** + **containment**) | Do they retrieve the same underlying *text*? This stays discriminating even on a 2‑document corpus, because it compares the retrieved passage text directly. Low content overlap with high document overlap = the two paths agree on *which book* but disagree on *which passages* — exactly the signal a small corpus otherwise hides. |
+
+> The two stores chunk the same source differently (Docling vs pypdfium), so chunk *ids* never align across them — that's why content overlap is **text‑shingle based** (chunk‑boundary agnostic) rather than a chunk‑id match. **Jaccard** is symmetric; **containment** (`|H∩S| / min(|H|,|S|)`) is robust to the simple side packing fuller chunks (asymmetric text volume).
+
 ### 17.4 What it measures — and what it does not
 
 Stated honestly, per the project's standards — **read this before quoting any number:**
 
-- **No labelled relevance set.** There is **no recall@k / nDCG** here. Answer quality is a **qualitative side‑by‑side**, not a score. Adding hand‑labelled qrels is the next step if you need an authoritative retrieval‑quality number.
+- **No labelled relevance set.** There is **no recall@k / nDCG** here. Answer quality is a **qualitative side‑by‑side**, not a score. The content‑overlap metric measures **agreement between the two systems**, not correctness — low overlap tells you they retrieve *differently*, not which one is *right*. Adding hand‑labelled qrels is the next step if you need an authoritative retrieval‑quality number.
 - **Cost is an estimate (±~10%).** Tokens are counted with `cl100k_base`; `gpt-4o-mini` bills on `o200k_base`, so the dollar figures are good for a *relative* comparison, not an invoice. Latency is exact wall‑clock. Verify the pricing constants in `benchmark_compare.py` against current OpenAI rates.
 - **Corpus parity matters.** Overlap aligns by source‑file hash, so it's only meaningful for PDFs in *both* stores (see the `baseline_corpus_miss` flag and the Documentum caveat in [§17.1](#171-step-1--ingest-the-baseline-corpus)).
 - **Two variables move at once** (parse *and* retrieval). This is an **end‑to‑end pipeline comparison by design**, not a single‑variable ablation. For a clean retrieval‑only number, re‑point the baseline at the *same chunk text the graph holds* instead of re‑parsing the PDF.

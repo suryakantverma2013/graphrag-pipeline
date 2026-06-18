@@ -54,7 +54,19 @@ Outputs (git-ignored, regenerated each run):
 
 Per query: latency, **estimated** OpenAI cost (metered on both paths), retrieved
 **document-set overlap** (Jaccard + top-1 agreement, aligned by source-file hash),
-and both synthesized answers side-by-side. Aggregate means + ratios at the top.
+retrieved **content overlap** (word 5-gram shingle Jaccard + containment), and both
+synthesized answers side-by-side. Aggregate means + ratios at the top.
+
+**Two overlap numbers, on purpose.** Document-set Jaccard saturates near 1.0 on a
+small corpus — with only a couple of documents, almost every hit maps to the same
+files, so it can't tell the two retrievers apart. The **content overlap** compares
+the actual retrieved passage *text* via word 5-gram shingles, so it still
+discriminates how differently hybrid and simple retrieve *within* the same
+document(s). The two stores chunk the source differently (Docling vs pypdfium), so
+chunk ids never align across them — shingles are chunk-boundary agnostic, which is
+why this is text-based rather than a chunk-id Jaccard. **Jaccard** (`|H∩S|/|H∪S|`)
+is symmetric; **containment** (`|H∩S|/min(|H|,|S|)`) is robust to the simple side
+packing fuller chunks (asymmetric text volume), so read the two together.
 
 **Honest limits — read before quoting a number:**
 - **No labelled relevance set.** There is no recall@k / nDCG here; answer quality

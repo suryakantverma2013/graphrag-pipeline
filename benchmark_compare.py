@@ -14,9 +14,11 @@ For every query it runs BOTH read paths and records a side-by-side comparison:
               system prompt + model.
 
 It captures, per query: latency, estimated OpenAI cost (metered on both sides),
-the retrieved DOCUMENT sets and their overlap (Jaccard + top-1 agreement), and
-both synthesized answers. Outputs a CSV (metrics), a JSON (full answers/hits),
-and a readable Markdown report.
+the retrieved DOCUMENT sets and their overlap (Jaccard + top-1 agreement), the
+retrieved CONTENT overlap (word 5-gram shingle Jaccard + containment, which stays
+discriminating even on a tiny corpus where document overlap saturates), and both
+synthesized answers. Outputs a CSV (metrics), a JSON (full answers/hits), and a
+readable Markdown report.
 
 SCOPE / HONESTY (the chosen scoring tier): this measures latency, cost, retrieval
 overlap, and shows both answers. It does NOT score answer correctness against a
@@ -34,6 +36,7 @@ import argparse
 import csv
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -207,6 +210,7 @@ def run_hybrid(query: str, config) -> dict[str, Any]:
         "confidence": round(conf, 4),
         "would_escalate": conf < threshold,
         "n_reranked": len(state.reranked),
+        "texts": [h.get("text") or "" for h in reranked[: config.rerank_top_k]],
         "latency_ms": round(latency_ms, 1),
     }
 
@@ -242,6 +246,7 @@ def run_simple(query: str, store: PgVectorStore, openai: OpenAIClient, config) -
         "answer": answer,
         "docs": docs,
         "n_hits": len(hits),
+        "texts": [h.get("text") or "" for h in hits],
         "latency_ms": round(latency_ms, 1),
     }
 
@@ -264,6 +269,50 @@ def _overlap(hybrid_docs: list[tuple[str, str]], simple_docs: list[tuple[str, st
     }
 
 
+# --- content-level overlap (chunk-boundary agnostic) ------------------------
+# Document-set overlap saturates near 1.0 on a small corpus (almost every hit
+# maps to the same handful of files), so it can't tell the two retrievers apart.
+# The hybrid and simple stores ALSO chunk the same source differently, so chunk
+# ids never align across them — a chunk_id Jaccard would always be 0. We instead
+# compare the retrieved *text* via word n-gram shingles: this measures whether
+# the two paths surfaced the same underlying passages regardless of where each
+# drew its chunk boundaries.
+_SHINGLE_N = 5
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _shingles(texts: list[str], n: int = _SHINGLE_N) -> set[tuple[str, ...]]:
+    """Set of word n-gram shingles over the concatenated passages (lower-cased)."""
+    sh: set[tuple[str, ...]] = set()
+    for t in texts:
+        toks = _WORD_RE.findall((t or "").lower())
+        for i in range(len(toks) - n + 1):
+            sh.add(tuple(toks[i : i + n]))
+    return sh
+
+
+def _content_overlap(hybrid_texts: list[str], simple_texts: list[str]) -> dict[str, Any]:
+    """Retrieved-content agreement: shingle Jaccard + containment of the smaller set.
+
+    `content_jaccard` = |H∩S| / |H∪S| — symmetric, but penalized when the two
+    sides retrieve very different *amounts* of text (the simple side packs fuller
+    chunks). `content_containment` = |H∩S| / min(|H|,|S|) — "how much of the
+    smaller passage set is also covered by the other path", robust to that volume
+    asymmetry. Read them together.
+    """
+    h = _shingles(hybrid_texts)
+    s = _shingles(simple_texts)
+    inter = len(h & s)
+    union = len(h | s)
+    smaller = min(len(h), len(s))
+    return {
+        "content_jaccard": round(inter / union, 3) if union else 0.0,
+        "content_containment": round(inter / smaller, 3) if smaller else 0.0,
+        "content_shingles_hybrid": len(h),
+        "content_shingles_simple": len(s),
+    }
+
+
 # ============================================================================
 # Report writers.
 # ============================================================================
@@ -271,6 +320,7 @@ def _write_csv(rows: list[dict]) -> None:
     fields = [
         "query", "hybrid_class", "hybrid_conf", "hybrid_escalate",
         "doc_jaccard", "top1_doc_match", "baseline_corpus_miss",
+        "content_jaccard", "content_containment",
         "hybrid_latency_ms", "simple_latency_ms",
         "hybrid_cost_usd", "simple_cost_usd",
         "hybrid_llm_calls", "simple_llm_calls",
@@ -297,6 +347,8 @@ def _write_report(rows: list[dict], agg: dict, store_docs: list[dict]) -> None:
     L.append(f"- Queries compared: **{agg['n']}**")
     L.append(f"- Mean document-set Jaccard (top-k): **{agg['mean_jaccard']:.3f}**")
     L.append(f"- Top-1 document agreement: **{agg['top1_rate']:.0%}**")
+    L.append(f"- **Mean retrieved-content overlap (5-gram shingle Jaccard): {agg['mean_content_jaccard']:.3f}** "
+             f"· containment of smaller set: **{agg['mean_content_containment']:.3f}**")
     L.append(f"- Queries outside the baseline corpus (flagged): **{agg['baseline_misses']}**")
     L.append(f"- Mean latency — hybrid **{agg['mean_hybrid_latency']:.0f} ms** vs simple "
              f"**{agg['mean_simple_latency']:.0f} ms** "
@@ -306,6 +358,15 @@ def _write_report(rows: list[dict], agg: dict, store_docs: list[dict]) -> None:
              f"({agg['cost_ratio']:.1f}× )")
     L.append(f"- Mean LLM calls/query — hybrid **{agg['mean_hybrid_calls']:.1f}** vs simple "
              f"**{agg['mean_simple_calls']:.1f}**\n")
+
+    L.append("> **Why two overlap numbers?** **Document-set Jaccard** saturates when the "
+             "corpus has few documents (almost every hit maps to the same handful of files), "
+             "so it can't tell the two retrievers apart. **Retrieved-content overlap** compares "
+             "the actual passage *text* via word 5-gram shingles, so it still discriminates how "
+             "differently the two paths retrieve even *within* the same document(s). The two "
+             "stores chunk the source differently, so chunk ids can't be matched directly — "
+             "shingles are chunk-boundary agnostic. *Jaccard* is symmetric; *containment* "
+             "(`|H∩S| / min(|H|,|S|)`) is robust to the simple side packing fuller chunks.\n")
 
     L.append("> **Caveat:** answer quality below is a qualitative side-by-side. No "
              "labelled relevance set was used, so there is no recall@k / nDCG number here. "
@@ -325,6 +386,8 @@ def _write_report(rows: list[dict], agg: dict, store_docs: list[dict]) -> None:
         L.append(f"- hybrid class=`{r['hybrid_class']}` confidence={r['hybrid_conf']:.3f}"
                  f"{' (would escalate)' if r['hybrid_escalate'] else ''}")
         L.append(f"- doc Jaccard={r['doc_jaccard']:.2f}  top-1 match={r['top1_doc_match']}{flag}")
+        L.append(f"- content overlap: shingle Jaccard={r['content_jaccard']:.2f}  "
+                 f"containment={r['content_containment']:.2f}")
         L.append(f"- latency: hybrid {r['hybrid_latency_ms']:.0f} ms / simple {r['simple_latency_ms']:.0f} ms  ·  "
                  f"est cost: hybrid ${r['hybrid_cost_usd']:.5f} / simple ${r['simple_cost_usd']:.5f}")
         L.append(f"- hybrid docs: {', '.join(t for _, t in r['hybrid_docs']) or '(none)'}")
@@ -378,7 +441,7 @@ def main(argv: list[str]) -> int:
 
     print(f"Benchmarking {len(queries)} query(ies); baseline store = {store_count} chunks "
           f"over {len(store_docs)} docs; top-k = {config.rerank_top_k}\n")
-    hdr = f"{'#':>3}  {'jacc':>5}  {'t1':>3}  {'h_ms':>7}  {'s_ms':>7}  {'h_$':>8}  {'s_$':>8}  query"
+    hdr = f"{'#':>3}  {'djac':>5}  {'cjac':>5}  {'ccon':>5}  {'t1':>3}  {'h_ms':>7}  {'s_ms':>7}  {'h_$':>8}  {'s_$':>8}  query"
     print(hdr)
     print("-" * len(hdr))
 
@@ -397,12 +460,14 @@ def main(argv: list[str]) -> int:
             continue
 
         ov = _overlap(hyb["docs"], sim["docs"])
+        cov = _content_overlap(hyb["texts"], sim["texts"])
         row = {
             "query": query,
             "hybrid_class": hyb["query_class"],
             "hybrid_conf": hyb["confidence"],
             "hybrid_escalate": hyb["would_escalate"],
             **ov,
+            **cov,
             "hybrid_latency_ms": hyb["latency_ms"],
             "simple_latency_ms": sim["latency_ms"],
             "hybrid_cost_usd": hyb_usage["est_cost_usd"],
@@ -418,7 +483,8 @@ def main(argv: list[str]) -> int:
             "simple_answer": sim["answer"],
         }
         rows.append(row)
-        print(f"{i:>3}  {ov['doc_jaccard']:>5.2f}  {('Y' if ov['top1_doc_match'] else '·'):>3}  "
+        print(f"{i:>3}  {ov['doc_jaccard']:>5.2f}  {cov['content_jaccard']:>5.2f}  {cov['content_containment']:>5.2f}  "
+              f"{('Y' if ov['top1_doc_match'] else '·'):>3}  "
               f"{hyb['latency_ms']:>7.0f}  {sim['latency_ms']:>7.0f}  "
               f"{hyb_usage['est_cost_usd']:>8.5f}  {sim_usage['est_cost_usd']:>8.5f}  {query[:48]}")
 
@@ -432,6 +498,8 @@ def main(argv: list[str]) -> int:
     agg = {
         "n": n,
         "mean_jaccard": mean("doc_jaccard"),
+        "mean_content_jaccard": mean("content_jaccard"),
+        "mean_content_containment": mean("content_containment"),
         "top1_rate": sum(1 for r in rows if r["top1_doc_match"]) / n,
         "baseline_misses": sum(1 for r in rows if r["baseline_corpus_miss"]),
         "mean_hybrid_latency": mean("hybrid_latency_ms"),
@@ -456,6 +524,8 @@ def main(argv: list[str]) -> int:
     print(
         f"\n— Summary over {n} query(ies) —\n"
         f"  doc Jaccard (mean):      {agg['mean_jaccard']:.3f}\n"
+        f"  content overlap (mean):  jaccard {agg['mean_content_jaccard']:.3f} / "
+        f"containment {agg['mean_content_containment']:.3f}\n"
         f"  top-1 doc agreement:     {agg['top1_rate']:.0%}\n"
         f"  baseline corpus misses:  {agg['baseline_misses']}\n"
         f"  latency  hybrid/simple:  {agg['mean_hybrid_latency']:.0f} / {agg['mean_simple_latency']:.0f} ms "
