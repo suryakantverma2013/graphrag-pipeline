@@ -257,6 +257,7 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
 | `CHUNK_MAX_TOKENS` | `512` | FR-3.4 |
 | `CHUNK_OVERLAP_TOKENS` | `50` | FR-3.4 |
 | `EMBED_BATCH_SIZE` | `100` | FR-6.2 |
+| `EMBED_MAX_INPUT_TOKENS` | `8192` | FR-3.8 — embedding model's hard per-input token limit; oversized whole-block chunks are hard-split to stay under it |
 | `NEO4J_WRITE_BATCH_CHUNKS` | `250` | FR-7.1 — chunks per write transaction (bounds tx size; failure compensated by FR-7.8) |
 | `TAG_CONFIDENCE_THRESHOLD` | `0.5` | FR-4.7 |
 | `REFINE_CONFIDENCE_THRESHOLD` | `0.6` | FR-Q1.4 |
@@ -318,14 +319,19 @@ All secrets and tunables are supplied via environment variables (loaded from `.e
   - **FR-2.8d** `PDF_RENDER_DPI_OCR` (default `150`). The render DPI used **when the OCR decision is on** (FR-2.3e). Unlike a born-digital page, a **scanned** page's rasterized bitmap is the *only* text source EasyOCR reads, so a low DPI (72) degrades recognition of small glyphs — subscripts, mathematical notation, diacritics. The `parse` node folds this into the effective `PDF_RENDER_DPI` only when `do_ocr` is true (via the same `model_copy` fold that selects the smaller OCR slice size, FR-2.8c/FR-2.3e); the born-digital fast path keeps FR-2.8b's 72 dpi untouched. Cost scales ~dpi², so a higher OCR DPI raises per-slice memory and parse time — if it OOMs (`std::bad_alloc`), lower `PDF_PARSE_BATCH_PAGES_OCR` (FR-2.8c) to compensate. Applies to PDF/image OCR input only. Defaults preserve born-digital behavior; the only effect is sharper scanned-PDF OCR.
   - **FR-2.8c** `PDF_PARSE_BATCH_PAGES` (default `100`; `0` = legacy single convert). **The fix for very large PDFs (v2.13).** A PDF is parsed in page-range slices of this size via repeated `convert(..., page_range=(lo, hi))` calls on the same reused converter, releasing each slice's transient memory before the next, so Docling never accumulates past its OOM ceiling. `chunk` then consumes the ordered list of slice documents with **continuous** section-stack and chunk-position tracking (buffers flush only at section headers and once at the end — never between slices), so chunking is identical to a single-shot parse. Captures the WHOLE document. Verified: a 610-page book that previously dropped ~half its pages to `std::bad_alloc` now parses all 610 pages (`failed_pages=0`) in 7 slices. Applies to PDF input only; interacts with FR-2.8a (the cap bounds the last slice).
 
-### 3.3 Stage 3 — Structural Chunking
+### 3.3 Stage 3 — Structural (Layout-Aware) Chunking
+
+Chunking is driven by the document's **structure** (Docling's typed layout items), not blind fixed-size windows: each content type is chunked by its own rule so semantically-coherent units stay intact, while prose is packed to a token budget. Continuity is preserved across parse slices (FR-2.8c).
+
 - **FR-3.1** Tables → exactly one chunk each (structure preserved, never split).
 - **FR-3.2** Lists/procedures → one chunk each (step order preserved).
 - **FR-3.3** Warnings (safety-critical) → one chunk each, **never fragmented**.
-- **FR-3.4** Paragraph text → split at **512 tokens** with **50-token sentence-boundary overlap** (tiktoken-counted).
+- **FR-3.3a** Code/formula blocks → kept whole (one chunk each, never fragmented), like tables.
+- **FR-3.4** Paragraph text → split at **512 tokens** with **50-token sentence-boundary overlap** (tiktoken-counted); an oversized single sentence is hard-split into ≤512-token windows.
 - **FR-3.5** Each chunk carries: `parent_section_path, document_title, content_type, position, token_count`.
-- **FR-3.6** Section headings → context metadata on chunks, not standalone chunks.
+- **FR-3.6** Section headings → context metadata on chunks (build `section_path`), not standalone chunks.
 - **FR-3.7** Store `ChunkList, total_tokens`, per-chunk `section_path`.
+- **FR-3.8** Every chunk — including the "kept whole" types (FR-3.1/3.2/3.3/3.3a) — is hard-capped to `EMBED_MAX_INPUT_TOKENS` minus a fixed prefix margin (for the embedding context prefix, FR-6.3). Any oversized whole-block chunk is hard-split into within-limit windows, logged as a warning, so a single large table/formula/list run can never exceed the embedding model's per-input limit and fail the run (relates to FR-6.x).
 
 ### 3.4 Stage 4 — iiRDS Tagging
 - **FR-4.1** **One `gpt-4o-mini` call per document** (not per chunk), sending first **3000 chars**.
@@ -674,7 +680,8 @@ Assumptions:
 - **AC-4** Simulated embedding failure → no Neo4j write; file re-ingestable.
 - **AC-5** Low-confidence tagging suspends at human review; `python review_tags.py <thread_id>` resumes and completes with corrected tags.
 - **AC-6** Simulated Neo4j write failure → zero partial data (compensating delete of the partial doc + committed chunk batches), safely retryable.
-- **AC-7** Tables/lists/warnings each appear as single unfragmented chunks; long paragraphs split at ~512 tokens with 50-token overlap.
+- **AC-7** Tables/lists/warnings/code each appear as single unfragmented chunks; long paragraphs split at ~512 tokens with 50-token overlap.
+- **AC-7b** A document containing a whole-block chunk larger than `EMBED_MAX_INPUT_TOKENS` (e.g. a huge table or formula block) still ingests successfully: the block is hard-split into within-limit chunks (logged) and the embed call is never rejected for exceeding the input limit (FR-3.8).
 - **AC-7a** A scanned/image-only PDF is parsed with text recognized via **EasyOCR running on the GPU** (no OpenAI/cloud OCR call); `RERANKER_DEVICE`/OCR CPU fallback still produces text when CUDA is forced off.
 - **AC-8** Neo4j container restart preserves all ingested data (volume persistence).
 - **AC-8a** A suspended (interrupted) run survives a **Postgres** service restart and resumes from persisted checkpoint state via its `thread_id` (D15).

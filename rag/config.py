@@ -119,6 +119,12 @@ class AppConfig(BaseSettings):
     chunk_max_tokens: int = 512             # FR-3.4
     chunk_overlap_tokens: int = 50          # FR-3.4
     embed_batch_size: int = 100             # FR-6.2
+    # Hard per-input token ceiling of the embedding model: text-embedding-3-small
+    # rejects any single input > 8192 tokens with HTTP 400. Chunks are split to
+    # stay under this (minus a prefix margin) so one oversized whole-block chunk
+    # (large table / formula / list run) can never fail the whole ingestion
+    # (FR-3.x / FR-6.x). Lower only if switching to a smaller-context model.
+    embed_max_input_tokens: int = 8192
     # Chunk-write batch size for the Neo4j write (FR-7.1). The per-document graph
     # write was originally ONE transaction; on very large books it grew to ~240k
     # store commands and Neo4j failed to apply it to the store ("Failed to apply

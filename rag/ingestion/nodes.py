@@ -391,6 +391,13 @@ def parse(state: IngestionState) -> dict:
 
 
 # --- Stage 3: Structural chunking (FR-3.x) ----------------------------------
+# Token budget reserved for the context prefix that `_embed_text` prepends at
+# embed time ("[Document: <title>] [Section: <section_path>]\n"). The per-chunk
+# token ceiling is `embed_max_input_tokens` MINUS this margin, so the prefixed
+# text still fits the embedding model's 8192-token hard limit (FR-6.x).
+_EMBED_PREFIX_TOKEN_MARGIN = 256
+
+
 def _split_long_sentence(tokens: list[int], max_tokens: int, enc) -> Iterator[list[int]]:
     """Hard-split a single oversized sentence into <= max_tokens token windows."""
     for start in range(0, len(tokens), max_tokens):
@@ -466,10 +473,12 @@ def chunk(state: IngestionState) -> dict:
         parts.extend(text for _, text in section_stack)
         return " > ".join(parts)
 
-    def add_chunk(text: str, content_type: str) -> None:
-        text = text.strip()
-        if not text:
-            return
+    # Per-chunk token ceiling: the embedding model's hard input limit, less the
+    # margin for the context prefix added at embed time (FR-6.x). No chunk may
+    # exceed this or the embed API rejects the whole batch with HTTP 400.
+    embed_cap = max(1, config.embed_max_input_tokens - _EMBED_PREFIX_TOKEN_MARGIN)
+
+    def _emit_chunk(text: str, content_type: str, token_count: int) -> None:
         position = len(chunks)
         chunks.append(
             {
@@ -479,9 +488,30 @@ def chunk(state: IngestionState) -> dict:
                 "section_path": section_path(),
                 "document_title": state.title,  # FR-3.5
                 "position": position,
-                "token_count": len(enc.encode(text)),
+                "token_count": token_count,
             }
         )
+
+    def add_chunk(text: str, content_type: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        tokens = enc.encode(text)
+        if len(tokens) <= embed_cap:
+            _emit_chunk(text, content_type, len(tokens))
+            return
+        # Oversized whole-block chunk (large table / formula / code / list run).
+        # Prose is already pre-split to chunk_max_tokens, so this only triggers on
+        # the "kept whole" content types — hard-split it into <=embed_cap windows
+        # so the embedding API never rejects it (FR-6.x). Logged so the split is
+        # visible: the block's internal structure is necessarily broken here.
+        logger.warning(
+            "chunk exceeds embed cap (%d > %d tokens); hard-splitting %s block into %d parts",
+            len(tokens), embed_cap, content_type,
+            (len(tokens) + embed_cap - 1) // embed_cap,
+        )
+        for window in _split_long_sentence(tokens, embed_cap, enc):
+            _emit_chunk(enc.decode(window), content_type, len(window))
 
     def flush_text() -> None:
         """Sentence-pack the accumulated paragraph text into 512-token chunks (FR-3.4)."""

@@ -71,7 +71,7 @@ These are the engineering decisions worth highlighting — the things that make 
 | **Durable checkpointing + resumable human‑in‑the‑loop** | A run that pauses (low‑confidence tags, ambiguous query, low‑confidence retrieval) persists full state to Postgres and resumes later by `thread_id` — surviving process exit and even a Postgres restart. |
 | **Atomic, all‑or‑nothing graph writes** | The document is written to Neo4j in bounded per‑batch transactions (so a huge book can't overflow a single transaction and wedge the store). A failure triggers a compensating delete, leaving **zero** partial data; the file is safe to re‑submit. |
 | **Exactly‑once ingestion via SHA‑256 dedup** | The document hash is its canonical id. Re‑submitting the same bytes terminates cleanly as a duplicate with **no OpenAI calls** (zero cost). |
-| **Structure‑aware chunking** | Tables, lists, and safety warnings are each kept as one unfragmented chunk; prose is packed to 512 tokens with 50‑token sentence‑boundary overlap. Section paths are carried as chunk context. |
+| **Layout‑aware chunking** | Driven by document structure, not blind fixed‑size windows: tables, lists, code/formula blocks, and safety warnings are each kept as one unfragmented chunk; prose is packed to 512 tokens with 50‑token sentence‑boundary overlap; every chunk is hard‑capped to the embedding model's input limit (oversized blocks are split, never dropped). Section paths are carried as chunk context. |
 | **Hybrid retrieval, always parallel** | BM25 (lexical), vector (semantic), and graph (relational) retrieval **all** run for every query. The query class re‑weights their contributions; it never disables a retriever. |
 | **Weighted Reciprocal Rank Fusion (RRF)** | Rank‑based fusion is scale‑invariant across the incompatible Lucene/cosine/graph score scales, and a retriever returning nothing degrades for free. One shared RRF helper serves both merge‑time and synthesis‑time fusion. |
 | **Local GPU cross‑encoder re‑ranking** | `BAAI/bge-reranker-v2-m3` scores every (query, chunk) pair on the GPU — more accurate than bi‑encoder cosine, free per call, low‑latency, and the retrieved chunk text never egresses for re‑ranking. |
@@ -317,6 +317,7 @@ All settings come from environment variables (loaded from `.env`). A single type
 | `CHUNK_MAX_TOKENS` | `512` | Max tokens per prose chunk. |
 | `CHUNK_OVERLAP_TOKENS` | `50` | Sentence‑boundary overlap between prose chunks. |
 | `EMBED_BATCH_SIZE` | `100` | Chunks per embedding API call. |
+| `EMBED_MAX_INPUT_TOKENS` | `8192` | Hard per‑input token limit of the embedding model (`text-embedding-3-small`). Any whole‑block chunk (large table / formula / list run) longer than this — minus a prefix margin — is hard‑split during chunking so the embed call can't be rejected with HTTP 400. Lower only for a smaller‑context model. |
 | `NEO4J_WRITE_BATCH_CHUNKS` | `250` | Chunks per Neo4j write transaction. Bounds transaction size so a very large book can't overflow a single transaction (which wedged the store). A failed write is compensated by deleting the partial document. Lower it if writes still strain on huge chunks. |
 | `TAG_CONFIDENCE_THRESHOLD` | `0.5` | Below → suspend for human tag review. |
 | `REFINE_CONFIDENCE_THRESHOLD` | `0.6` | Below → request clarification. |
@@ -350,7 +351,7 @@ flowchart TD
     B -->|unsupported / unreadable| ERR1([Exit 1 · INTAKE_ERROR])
     B -->|new document| C[Docling Parse · local GPU<br/>layout + tables + EasyOCR]
     C -->|parse failure / zero text| ERR2([Exit 1 · PARSE_ERROR])
-    C --> D[Structural Chunking<br/>tables / lists / warnings = 1 chunk<br/>prose = 512 tok, 50 overlap]
+    C --> D[Layout-aware Chunking<br/>tables / lists / code / warnings = 1 chunk<br/>prose = 512 tok, 50 overlap · capped at embed limit]
     D --> E[iiRDS Tagging · OpenAI gpt-4o-mini<br/>1 call · first 3000 chars]
     E -->|confidence ≥ 0.5| G
     E -->|confidence &lt; 0.5| F{{Human Review · interrupt<br/>review_tags.py thread_id}}
@@ -372,7 +373,7 @@ flowchart TD
    - **Duplicate** → terminate `DUPLICATE` (exit `3`), no OpenAI calls. Re‑ingestion is not supported; ingest an updated source as a new file.
    - **Unsupported/unreadable** → `INTAKE_ERROR` (exit `1`).
 2. **Docling parse (local, GPU).** Raw bytes are written to an owner‑only temp file, parsed fully locally with DocLayNet (layout) + TableFormer (tables), with **EasyOCR** for scanned/image PDFs. When `OCR_ENABLED=auto` (default), the PDF is first classified from its text layer (`pdf_kind=…` is logged) and OCR — plus the slice size — is chosen automatically; `on`/`off` force it. The temp file is deleted immediately after parse (success or failure). A parse failure or zero‑text result → `PARSE_ERROR` (exit `1`).
-3. **Structural chunking.** Walks the document tree tracking a section‑header stack. **Tables** → one Markdown chunk each. Consecutive **list items** → one chunk. Leading **safety warnings** (WARNING/CAUTION/DANGER/NOTICE/IMPORTANT) → one unfragmented chunk. **Prose** → packed to 512 tokens with 50‑token sentence‑boundary overlap. Each chunk carries its section path, document title, content type, position, and token count.
+3. **Structural chunking (layout‑aware).** Driven by the document's *structure* (Docling's typed layout items), not blind fixed‑size splitting — each content type is chunked by its own rule so semantically‑coherent units stay intact. Walks the document tree tracking a section‑header stack (which builds each chunk's `section_path` breadcrumb; headings are context, never standalone chunks). **Tables** → one Markdown chunk each (structure preserved). Consecutive **list items** → one chunk. **Code / formula** blocks → kept whole. Leading **safety warnings** (WARNING/CAUTION/DANGER/NOTICE/IMPORTANT) → one unfragmented chunk. **Prose** → greedily sentence‑packed to 512 tokens with 50‑token sentence‑boundary overlap (an oversized single sentence is hard‑split). Accumulators persist **across parse slices**, so a paragraph or list straddling a 10‑page slice boundary stays continuous. Every chunk is finally capped at `EMBED_MAX_INPUT_TOKENS` (less a prefix margin): any oversized whole‑block chunk is hard‑split into within‑limit windows — logged as a warning — so it can never exceed the embedding model's input limit. Each chunk carries its section path, document title, content type, position, and token count.
 4. **iiRDS tagging.** **One** `gpt-4o-mini` call per document over the first 3000 chars extracts `product`, `components`, `lifecycle_phase`, `information_type`, and `language`, plus a `confidence` score. Closed enums are normalized; out‑of‑vocabulary values become `None`. Retries 3× with exponential backoff.
    - `confidence ≥ 0.5` → continue to embedding.
    - `confidence < 0.5` → **suspend** at human review (see [§10](#10-human-in-the-loop-operations)).

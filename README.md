@@ -44,7 +44,7 @@ This is not a "embed-and-cosine" RAG demo. The engineering choices are the point
 - 💾 **Durable, resumable human-in-the-loop** — low-confidence tags, ambiguous queries, and low-confidence retrievals **pause and checkpoint to Postgres**, then resume by `thread_id` — surviving process *and* database restarts.
 - ⚛️ **Atomic, all-or-nothing graph writes** — a failure leaves **zero** partial data; the file is safe to re-submit.
 - 🔁 **Exactly-once ingestion** via SHA-256 dedup — re-submitting the same bytes costs **nothing** (zero OpenAI calls).
-- 🧩 **Structure-aware chunking** — tables, lists, and safety warnings stay as single unfragmented chunks; prose is packed to 512 tokens with sentence-boundary overlap.
+- 🧩 **Layout-aware chunking** — driven by document structure, not blind fixed-size windows: tables, lists, code/formula blocks, and safety warnings each stay as single unfragmented chunks; prose is packed to 512 tokens with sentence-boundary overlap; every chunk is hard-capped to the embedding model's input limit so even a huge table can't fail the run.
 - 🔀 **Always-parallel hybrid retrieval** — BM25 + vector + graph run for *every* query; the query class **re-weights** them via **weighted Reciprocal Rank Fusion** (scale-invariant, degrades for free).
 - 🎯 **Local GPU cross-encoder re-ranking** (`BAAI/bge-reranker-v2-m3`) — more accurate than bi-encoder cosine, free per call, and the retrieved text never egresses.
 - 🚦 **Composite-confidence escalation gate** — escalates to a human instead of returning a confident-sounding weak answer.
